@@ -1,0 +1,7 @@
+PyQt5>=5.15.10
+opencv-python>=4.9.0
+numpy>=1.26.0
+psutil>=5.9.0
+keyboard>=0.13.5
+pyvirtualcam>=0.12.0
+Pillow>=10.0.0
