@@ -1,0 +1,618 @@
+
+/* 
+Встроенный стиль v3: интегрирован из пользовательского style.qss.
+Если рядом с программой лежит внешний style.qss, он по-прежнему имеет приоритет.
+*/
+/*
+style.qss — тема КругоЗор в визуальной логике CalcNumLock / Win11 Calculator.
+
+Назначение:
+  • единый тёмный стиль для диалогов, контекстного меню и меню трея;
+  • мягкие hover/pressed-состояния;
+  • Segoe UI Variable / Segoe UI;
+  • скругления 4/8 px;
+  • аккуратные QSlider, QSpinBox, QCheckBox, QRadioButton;
+  • совместимость с текущей загрузкой STYLE_QSS в KruGoZor.pyw.
+
+Файл положить рядом с KruGoZor.pyw под именем style.qss.
+*/
+
+/* -------------------------------------------------------------------------
+   Базовая палитра
+   ------------------------------------------------------------------------- */
+* {
+    font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+    font-size: 13px;
+    outline: none;
+}
+
+QWidget,
+QDialog,
+QMessageBox {
+    background-color: #202020;
+    color: #FFFFFF;
+}
+
+QLabel {
+    color: #FFFFFF;
+    background: transparent;
+}
+
+QLabel:disabled {
+    color: #5F5F5F;
+}
+
+QToolTip {
+    background-color: #2B2B2B;
+    color: #FFFFFF;
+    border: 1px solid #3B3B3B;
+    border-radius: 4px;
+    padding: 4px 8px;
+}
+
+/* -------------------------------------------------------------------------
+   Группы и контейнеры диалогов
+   ------------------------------------------------------------------------- */
+QGroupBox {
+    color: #FFFFFF;
+    background: transparent;
+    border: 1px solid #2B2B2B;
+    border-radius: 8px;
+    margin-top: 10px;
+    padding: 9px 7px 7px 7px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 5px;
+    color: #A6A6A6;
+    background-color: #202020;
+}
+
+QFrame {
+    background: transparent;
+    border: none;
+}
+
+QFrame[frameShape="4"],
+QFrame[frameShape="5"] {
+    color: #2D2D2D;
+    background-color: #2D2D2D;
+}
+
+/* -------------------------------------------------------------------------
+   Поля ввода
+   ------------------------------------------------------------------------- */
+QLineEdit,
+QComboBox,
+QSpinBox,
+QDoubleSpinBox,
+QPlainTextEdit,
+QTextEdit {
+    background-color: #323232;
+    color: #FFFFFF;
+    border: 1px solid #2B2B2B;
+    border-radius: 4px;
+    padding: 4px 7px;
+    selection-background-color: #4CC2FF;
+    selection-color: #000000;
+}
+
+QLineEdit:hover,
+QComboBox:hover,
+QSpinBox:hover,
+QDoubleSpinBox:hover,
+QPlainTextEdit:hover,
+QTextEdit:hover {
+    background-color: #3C3C3C;
+}
+
+QLineEdit:focus,
+QComboBox:focus,
+QSpinBox:focus,
+QDoubleSpinBox:focus,
+QPlainTextEdit:focus,
+QTextEdit:focus {
+    border: 1px solid #4CC2FF;
+    background-color: #323232;
+}
+
+QLineEdit:disabled,
+QComboBox:disabled,
+QSpinBox:disabled,
+QDoubleSpinBox:disabled,
+QPlainTextEdit:disabled,
+QTextEdit:disabled {
+    color: #5F5F5F;
+    background-color: #2A2A2A;
+    border-color: #2B2B2B;
+}
+
+QSpinBox::up-button,
+QSpinBox::down-button,
+QDoubleSpinBox::up-button,
+QDoubleSpinBox::down-button {
+    background-color: #323232;
+    border: none;
+    width: 16px;
+}
+
+QSpinBox::up-button:hover,
+QSpinBox::down-button:hover,
+QDoubleSpinBox::up-button:hover,
+QDoubleSpinBox::down-button:hover {
+    background-color: #454545;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 22px;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #2B2B2B;
+    color: #FFFFFF;
+    border: 1px solid #2B2B2B;
+    selection-background-color: #454545;
+    selection-color: #FFFFFF;
+    padding: 4px;
+}
+
+/* -------------------------------------------------------------------------
+   Кнопки
+   ------------------------------------------------------------------------- */
+QPushButton,
+QToolButton {
+    background-color: #323232;
+    color: #FFFFFF;
+    border: 1px solid #2B2B2B;
+    border-radius: 4px;
+    padding: 5px 14px;
+    min-height: 26px;
+    font-weight: 400;
+}
+
+QToolButton {
+    padding: 2px 7px;
+    min-width: 26px;
+    min-height: 24px;
+}
+
+QPushButton:hover,
+QToolButton:hover {
+    background-color: #3C3C3C;
+}
+
+QPushButton:pressed,
+QToolButton:pressed {
+    background-color: #2A2A2A;
+}
+
+QPushButton:disabled,
+QToolButton:disabled {
+    color: #5F5F5F;
+    background-color: #2A2A2A;
+    border-color: #2B2B2B;
+}
+
+QPushButton:default {
+    background-color: #4CC2FF;
+    color: #000000;
+    border: 1px solid #4CC2FF;
+    font-weight: 600;
+}
+
+QPushButton:default:hover {
+    background-color: #5DC9FF;
+}
+
+QPushButton:default:pressed {
+    background-color: #3FB7F5;
+}
+
+/* -------------------------------------------------------------------------
+   Чекбоксы и радиокнопки
+   ------------------------------------------------------------------------- */
+QCheckBox,
+QRadioButton {
+    color: #FFFFFF;
+    background: transparent;
+    spacing: 6px;
+    padding: 2px 0;
+}
+
+QCheckBox:disabled,
+QRadioButton:disabled {
+    color: #5F5F5F;
+}
+
+QCheckBox::indicator,
+QRadioButton::indicator {
+    width: 14px;
+    height: 14px;
+}
+
+QCheckBox::indicator:unchecked {
+    background-color: #323232;
+    border: 1px solid #5F5F5F;
+    border-radius: 3px;
+}
+
+QCheckBox::indicator:unchecked:hover {
+    background-color: #3C3C3C;
+    border-color: #A6A6A6;
+}
+
+QCheckBox::indicator:checked {
+    background-color: #4CC2FF;
+    border: 1px solid #4CC2FF;
+    border-radius: 3px;
+}
+
+QCheckBox::indicator:checked:hover {
+    background-color: #5DC9FF;
+    border-color: #5DC9FF;
+}
+
+QRadioButton::indicator:unchecked {
+    background-color: #323232;
+    border: 1px solid #5F5F5F;
+    border-radius: 7px;
+}
+
+QRadioButton::indicator:unchecked:hover {
+    background-color: #3C3C3C;
+    border-color: #A6A6A6;
+}
+
+QRadioButton::indicator:checked {
+    background: qradialgradient(
+        cx: 0.5, cy: 0.5, radius: 0.5,
+        stop: 0 #4CC2FF,
+        stop: 0.44 #4CC2FF,
+        stop: 0.48 #323232,
+        stop: 1 #323232
+    );
+    border: 1px solid #4CC2FF;
+    border-radius: 7px;
+}
+
+/* -------------------------------------------------------------------------
+   Слайдеры
+   ------------------------------------------------------------------------- */
+QSlider {
+    background: transparent;
+}
+
+QSlider::groove:horizontal {
+    height: 4px;
+    background-color: #2D2D2D;
+    border: none;
+    border-radius: 2px;
+}
+
+QSlider::sub-page:horizontal {
+    background-color: #4CC2FF;
+    border-radius: 2px;
+}
+
+QSlider::add-page:horizontal {
+    background-color: #2D2D2D;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    width: 13px;
+    height: 13px;
+    margin: -5px 0;
+    background-color: #4CC2FF;
+    border: none;
+    border-radius: 6px;
+}
+
+QSlider::handle:horizontal:hover {
+    background-color: #5DC9FF;
+}
+
+QSlider::handle:horizontal:pressed {
+    background-color: #3FB7F5;
+}
+
+QSlider::groove:vertical {
+    width: 4px;
+    background-color: #2D2D2D;
+    border: none;
+    border-radius: 2px;
+}
+
+QSlider::handle:vertical {
+    width: 13px;
+    height: 13px;
+    margin: 0 -5px;
+    background-color: #4CC2FF;
+    border: none;
+    border-radius: 6px;
+}
+
+/* -------------------------------------------------------------------------
+   Меню: контекстное и трей
+   ------------------------------------------------------------------------- */
+QMenu {
+    background-color: #2B2B2B;
+    color: #FFFFFF;
+    border: 1px solid #2B2B2B;
+    border-radius: 8px;
+    padding: 4px;
+    font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+    font-size: 13px;
+}
+
+QMenu::item {
+    background: transparent;
+    color: #FFFFFF;
+    padding: 6px 18px 6px 24px;
+    min-height: 18px;
+    border-radius: 4px;
+}
+
+QMenu::item:selected {
+    background-color: #454545;
+}
+
+QMenu::item:pressed {
+    background-color: #333333;
+}
+
+QMenu::item:disabled {
+    color: #5F5F5F;
+}
+
+QMenu::separator {
+    height: 1px;
+    background-color: #2D2D2D;
+    margin: 4px 8px;
+}
+
+QMenu::indicator {
+    width: 14px;
+    height: 14px;
+    margin-left: 4px;
+}
+
+QMenu::indicator:non-exclusive:unchecked {
+    background-color: #323232;
+    border: 1px solid #5F5F5F;
+    border-radius: 3px;
+}
+
+QMenu::indicator:non-exclusive:checked {
+    background-color: #4CC2FF;
+    border: 1px solid #4CC2FF;
+    border-radius: 3px;
+}
+
+QMenu::indicator:exclusive:unchecked {
+    background-color: #323232;
+    border: 1px solid #5F5F5F;
+    border-radius: 7px;
+}
+
+QMenu::indicator:exclusive:checked {
+    background: qradialgradient(
+        cx: 0.5, cy: 0.5, radius: 0.5,
+        stop: 0 #4CC2FF,
+        stop: 0.44 #4CC2FF,
+        stop: 0.48 #323232,
+        stop: 1 #323232
+    );
+    border: 1px solid #4CC2FF;
+    border-radius: 7px;
+}
+
+QMenu::right-arrow {
+    width: 9px;
+    height: 9px;
+}
+
+/* -------------------------------------------------------------------------
+   Таблицы / списки, если появятся в диалогах
+   ------------------------------------------------------------------------- */
+QListWidget,
+QListView,
+QTableWidget,
+QTableView,
+QTreeWidget,
+QTreeView {
+    background-color: #2B2B2B;
+    alternate-background-color: #323232;
+    color: #FFFFFF;
+    border: 1px solid #2B2B2B;
+    border-radius: 4px;
+    gridline-color: #2D2D2D;
+    selection-background-color: #4CC2FF;
+    selection-color: #000000;
+}
+
+QListWidget::item,
+QListView::item,
+QTableWidget::item,
+QTableView::item,
+QTreeWidget::item,
+QTreeView::item {
+    color: #FFFFFF;
+    padding: 3px 5px;
+}
+
+QListWidget::item:selected,
+QListView::item:selected,
+QTableWidget::item:selected,
+QTableView::item:selected,
+QTreeWidget::item:selected,
+QTreeView::item:selected {
+    background-color: #4CC2FF;
+    color: #000000;
+}
+
+QHeaderView::section {
+    background-color: #323232;
+    color: #FFFFFF;
+    border: 1px solid #2B2B2B;
+    padding: 4px 6px;
+}
+
+QTableCornerButton::section {
+    background-color: #323232;
+    border: 1px solid #2B2B2B;
+}
+
+/* -------------------------------------------------------------------------
+   Скроллбары
+   ------------------------------------------------------------------------- */
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+
+QScrollArea > QWidget > QWidget {
+    background-color: #202020;
+}
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 4px 2px 4px 0;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #5F5F5F;
+    border-radius: 3px;
+    min-height: 20px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #A6A6A6;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 8px;
+    margin: 0 4px 2px 4px;
+}
+
+QScrollBar::handle:horizontal {
+    background-color: #5F5F5F;
+    border-radius: 3px;
+    min-width: 20px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background-color: #A6A6A6;
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0;
+}
+
+/* -------------------------------------------------------------------------
+   Диалоги сообщений
+   ------------------------------------------------------------------------- */
+QMessageBox QLabel {
+    color: #FFFFFF;
+    background: transparent;
+}
+
+QMessageBox QPushButton {
+    min-width: 82px;
+}
+
+/* -------------------------------------------------------------------------
+   Специальные роли, которые безопасно сработают только при object/property
+   ------------------------------------------------------------------------- */
+QLabel[role="dim"],
+QLabel[labelRole="dim"] {
+    color: #A6A6A6;
+}
+
+QLabel[role="error"],
+QLabel[labelRole="error"] {
+    color: #FF8A8A;
+}
+
+QLabel[role="ok"],
+QLabel[labelRole="ok"] {
+    color: #7DDA9F;
+}
+
+QPushButton[role="danger"] {
+    background-color: #5A2525;
+    color: #FFFFFF;
+    border-color: #6A3030;
+}
+
+QPushButton[role="danger"]:hover {
+    background-color: #6A3030;
+}
+
+QPushButton[role="danger"]:pressed {
+    background-color: #4A2020;
+}
+
+/* КругоЗор: токены оверлея предпросмотра
+--kgz-preview-line-width: 0.23;
+--kgz-preview-crop-circle-extra-width: 0.70;
+--kgz-preview-manual-crop: #2ea8ff;
+--kgz-preview-inactive-crop: #68727e;
+--kgz-preview-dynamic-crop: #ffcc4d;
+--kgz-preview-composition-circle: #ffd166;
+--kgz-preview-face-capture: #2ea8ff;
+--kgz-preview-drag-crop: #ad7cff;
+--kgz-preview-pipette-border: #ffffff;
+--kgz-preview-crosshair: #dce6f0;
+*/
+
+
+/* -------------------------------------------------------------------------
+   КругоЗор v8: гребёнка вкладок настроек
+   ------------------------------------------------------------------------- */
+QTabWidget#SettingsTabs::pane {
+    border: 1px solid #3A3A3A;
+    border-radius: 8px;
+    top: -1px;
+    background: #202020;
+}
+
+QTabWidget#SettingsTabs QTabBar::tab {
+    background: #252525;
+    color: #D6D6D6;
+    border: 1px solid #3A3A3A;
+    border-bottom-color: #2A2A2A;
+    padding: 6px 14px;
+    min-width: 120px;
+    border-top-left-radius: 7px;
+    border-top-right-radius: 7px;
+    margin-right: 2px;
+}
+
+QTabWidget#SettingsTabs QTabBar::tab:selected {
+    background: #303030;
+    color: #FFFFFF;
+    border-bottom-color: #303030;
+}
+
+QTabWidget#SettingsTabs QTabBar::tab:hover:!selected {
+    background: #2C2C2C;
+    color: #FFFFFF;
+}
+
+QTabWidget#SettingsTabs QScrollArea {
+    background: transparent;
+    border: none;
+}
+
