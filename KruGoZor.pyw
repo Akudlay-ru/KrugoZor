@@ -528,7 +528,17 @@ class CameraCaptureLoop(QtCore.QObject):
             th.join(timeout=1.2)
         self._thread = None
         if release:
-            with self._lock:
+            acquired = self._lock.acquire(timeout=0.25)
+            if not acquired:
+                # Не блокируем GUI, если DirectShow завис внутри cap.read() и
+                # удерживает lock. Пусть worker-поток умирает сам как-нибудь,
+                # человечество уже достаточно страдало от синхронного release().
+                try:
+                    self.stopped.emit()
+                except Exception:
+                    pass
+                return
+            try:
                 cap = self._cap
                 self._cap = None
                 if cap is not None:
@@ -536,6 +546,8 @@ class CameraCaptureLoop(QtCore.QObject):
                         cap.release()
                     except Exception:
                         pass
+            finally:
+                self._lock.release()
         else:
             self._cap = None
         self.stopped.emit()
@@ -703,6 +715,14 @@ class DynamicCropConfig:
     # center_dead_zone оставлен для совместимости. В v4 он = position_dead_zone.
     position_dead_zone: float = 0.06
     scale_dead_zone: float = 0.08
+    # Промежуточная UX-версия: автозум теперь явный режим, а не
+    # скрытый побочный эффект детектора. Да, галочка спасает нервы.
+    auto_zoom_enabled: bool = False
+    zoom_mode: str = "locked"  # auto | locked | manual
+    locked_diameter_ratio: float | None = None
+    manual_diameter_ratio: float = 0.42
+    auto_zoom_min_ratio: float = 0.18
+    auto_zoom_max_ratio: float = 0.80
     # face_box = старая логика; eyes_ipd = якорь по глазам, масштаб по межзрачковому.
     tracking_mode: str = "eyes_ipd"
     fast_roi_tracking: bool = True
@@ -730,17 +750,24 @@ class DynamicBox:
     y: float
     w: float
     h: float
+    anchor_x: float | None = None
+    anchor_y: float | None = None
+    scale_size: float | None = None
+    scale_source: str = "face"
+    ipd: float | None = None
 
     @property
     def cx(self) -> float:
-        return self.x + self.w / 2.0
+        return float(self.anchor_x) if self.anchor_x is not None else self.x + self.w / 2.0
 
     @property
     def cy(self) -> float:
-        return self.y + self.h / 2.0
+        return float(self.anchor_y) if self.anchor_y is not None else self.y + self.h / 2.0
 
     @property
     def size(self) -> float:
+        if self.scale_size is not None and self.scale_size > 1:
+            return float(self.scale_size)
         return max(self.w, self.h)
 
 @dataclass
@@ -835,6 +862,7 @@ class PTZRuntimeState:
     last_trigger: str = ""
     last_command: str = ""
     last_error: str = ""
+    failed_commands: int = 0
 
 @dataclass
 class AppState:
@@ -1645,6 +1673,8 @@ HOTKEY_DEFINITIONS = (
     ("vcam_mirror",    "Виртуальная камера: зеркало",       "B",      "shortcut", None),
     ("window_mirror",  "Окно: зеркало",                     "M",      "shortcut", None),
     ("dynamic_crop_toggle", "Динамический кроп: вкл/выкл",   "",       "menu",     "act_dynamic_crop"),
+    ("dynamic_auto_zoom_toggle", "Динамический кроп: автозум", "",      "menu",     "act_dynamic_auto_zoom"),
+    ("dynamic_lock_zoom", "Динамический кроп: зафиксировать масштаб", "", "menu",  "act_dynamic_lock_zoom"),
     ("scale_up",       "Окно: увеличить",                  "+",  "shortcut", None),
     ("scale_up_alt",   "Окно: увеличить",                  "=",  "shortcut", None),
     ("scale_down",     "Окно: уменьшить",                  "-",  "shortcut", None),
@@ -1833,6 +1863,11 @@ class ChromaDialog(QDialog):
         self.dynamic_tracking_mode_combo.addItem("Рамка лица", "face_box")
         self.dynamic_tracking_mode_combo.setToolTip("Глаза + IPD: позиция по центру между глазами, масштаб сначала по межзрачковому расстоянию; Рамка лица: старая логика по размеру лица.")
 
+        self.dynamic_auto_zoom_chk = QCheckBox("Автозум")
+        self.dynamic_auto_zoom_chk.setToolTip("Если выключено, динамический кроп следит за лицом, но не меняет масштаб. Наконец-то кто-то поставил тормоз этой карусели.")
+        self.dynamic_lock_zoom_btn = QPushButton("Зафиксировать масштаб")
+        self.dynamic_lock_zoom_btn.setToolTip("Запомнить текущий диаметр динамического кропа и отключить автозум.")
+
         self.dynamic_detector_combo = QtWidgets.QComboBox(self)
         self.dynamic_detector_combo.addItem("MediaPipe / landmarks", "mediapipe")
         self.dynamic_detector_combo.addItem("OpenCV Haar", "haar")
@@ -1925,9 +1960,8 @@ class ChromaDialog(QDialog):
         self.ptz_zoom_in_btn = QPushButton("Zoom +")
         self.ptz_zoom_out_btn = QPushButton("Zoom −")
 
-        # Эти кнопки всегда отправляют физическую PTZ-команду.
-        # Нужны для проверки камеры, потому что основные Pan/Tilt в режиме
-        # динамического кропа осознанно двигают композиционную цель.
+        # Эти кнопки оставлены как быстрый физический тест. Основные Pan/Tilt
+        # выше теперь тоже всегда физические; композиционная цель живёт отдельно.
         self.ptz_phys_left_btn = QPushButton("Физ. ←")
         self.ptz_phys_right_btn = QPushButton("Физ. →")
         self.ptz_phys_up_btn = QPushButton("Физ. ↑")
@@ -1967,6 +2001,8 @@ class ChromaDialog(QDialog):
         self._dynamic_setting_widgets = self._dynamic_setting_sliders + (
             self.dynamic_tracking_mode_combo,
             self.dynamic_detector_combo,
+            self.dynamic_auto_zoom_chk,
+            self.dynamic_lock_zoom_btn,
             self.dynamic_arrows_move_face_chk,
             self.dynamic_invert_x_chk,
             self.dynamic_invert_y_chk,
@@ -2158,6 +2194,8 @@ class ChromaDialog(QDialog):
             _w.valueChanged.connect(self._on_dynamic_setting_changed)
         self.dynamic_tracking_mode_combo.currentIndexChanged.connect(self._on_dynamic_setting_changed)
         self.dynamic_detector_combo.currentIndexChanged.connect(self._on_dynamic_setting_changed)
+        self.dynamic_auto_zoom_chk.toggled.connect(self._on_dynamic_auto_zoom_toggled)
+        self.dynamic_lock_zoom_btn.clicked.connect(self._on_dynamic_lock_zoom_clicked)
         for _w in (self.dynamic_arrows_move_face_chk, self.dynamic_invert_x_chk, self.dynamic_invert_y_chk):
             _w.toggled.connect(self._on_dynamic_setting_changed)
         self.dynamic_auto_center_btn.clicked.connect(self._on_dynamic_auto_center)
@@ -2342,6 +2380,8 @@ class ChromaDialog(QDialog):
         self._add_dynamic_slider_row(dl, row, "Запас вокруг лица", self.dynamic_padding_sld, self.dynamic_padding_val_lbl, "Дополнительный запас кадра вокруг композиционного круга."); row += 1
 
         dl.addWidget(self._dynamic_header("Движение"), row, 0, 1, 3); row += 1
+        dl.addWidget(self.dynamic_auto_zoom_chk, row, 0, 1, 1)
+        dl.addWidget(self.dynamic_lock_zoom_btn, row, 1, 1, 2); row += 1
         self._add_dynamic_slider_row(dl, row, "Плавность позиции", self.dynamic_smoothing_sld, self.dynamic_smoothing_val_lbl, "Сглаживание X/Y. Больше — быстрее догоняет положение, меньше — спокойнее."); row += 1
         self._add_dynamic_slider_row(dl, row, "Плавность масштаба", self.dynamic_scale_smoothing_sld, self.dynamic_scale_smoothing_val_lbl, "Сглаживание диаметра круга. Меньше — меньше дыхания зума."); row += 1
         self._add_dynamic_slider_row(dl, row, "Скорость возврата", self.dynamic_return_speed_sld, self.dynamic_return_speed_val_lbl, "Плавный возврат к центру, если лицо потеряно. По умолчанию выключен, чтобы кроп не дёргался."); row += 1
@@ -2797,6 +2837,8 @@ class ChromaDialog(QDialog):
         cfg.pan_step = float(self.ptz_pan_step_sld.value() / 10.0)
         cfg.tilt_step = float(self.ptz_tilt_step_sld.value() / 10.0)
         cfg.zoom_step = float(self.ptz_zoom_step_sld.value() / 10.0)
+        if hasattr(self.owner, "_sync_ptz_menu_actions"):
+            self.owner._sync_ptz_menu_actions()
         self._update_ptz_slider_labels()
         self._update_ptz_status()
         if self.owner.chroma.persist and hasattr(self.owner, "save_config"):
@@ -2806,19 +2848,10 @@ class ChromaDialog(QDialog):
         if self.owner is None:
             return
         ok = False
-        # В режиме динамического кропа Pan/Tilt двигают композиционную цель,
-        # а не мотор камеры. Иначе одна кнопка будет одновременно менять две
-        # системы координат. Нелепость понятная, но нам она не нужна.
-        if axis in ("pan", "tilt") and bool(getattr(self.owner.dynamic_crop, "enabled", False)):
-            step = float(getattr(self.owner.dynamic_crop, "nudge_step", COMPOSITION_NUDGE_STEP))
-            if axis == "pan":
-                self.owner._dynamic_adjust_offset(float(direction) * step, 0.0)
-            else:
-                self.owner._dynamic_adjust_offset(0.0, float(direction) * step)
-            self.owner._ptz_runtime.last_command = f"цель {axis} {direction:+d}"
-            self.owner._ptz_runtime.last_error = ""
-            ok = True
-        elif axis == "pan":
+        # Preview UX: кнопки Pan/Tilt/Zoom всегда управляют физической камерой.
+        # Сдвиг цели композиции вынесен в отдельные действия. Одна кнопка с
+        # двумя смыслами — это не интерфейс, это допрос с пристрастием.
+        if axis == "pan":
             ok = self.owner._ptz_pan(int(direction), reason="manual")
         elif axis == "tilt":
             ok = self.owner._ptz_tilt(int(direction), reason="manual")
@@ -2944,6 +2977,10 @@ class ChromaDialog(QDialog):
         self.dynamic_detector_combo.setCurrentIndex(detector_idx)
         self.dynamic_detector_combo.blockSignals(False)
 
+        self.dynamic_auto_zoom_chk.blockSignals(True)
+        self.dynamic_auto_zoom_chk.setChecked(bool(getattr(cfg, "auto_zoom_enabled", False)) or str(getattr(cfg, "zoom_mode", "locked") or "locked").lower() == "auto")
+        self.dynamic_auto_zoom_chk.blockSignals(False)
+
         for widget, value in (
             (self.dynamic_arrows_move_face_chk, bool(getattr(cfg, "arrows_move_face", True))),
             (self.dynamic_invert_x_chk, bool(getattr(cfg, "invert_arrows_x", False))),
@@ -3036,6 +3073,25 @@ class ChromaDialog(QDialog):
         self._update_crop_label()
         if self.owner.chroma.persist and hasattr(self.owner, "save_config"):
             self.owner.save_config()
+
+    def _on_dynamic_auto_zoom_toggled(self, value: bool):
+        if self.owner is None:
+            return
+        if hasattr(self.owner, "set_dynamic_auto_zoom"):
+            self.owner.set_dynamic_auto_zoom(bool(value), save=True)
+        self._load_dynamic_from_owner()
+        self._update_crop_label()
+
+    def _on_dynamic_lock_zoom_clicked(self):
+        if self.owner is None:
+            return
+        ok = False
+        if hasattr(self.owner, "lock_dynamic_zoom_from_current"):
+            ok = bool(self.owner.lock_dynamic_zoom_from_current(save=True, notify=False))
+        self._load_dynamic_from_owner()
+        self._update_crop_label()
+        if not ok:
+            QMessageBox.information(self, "Динамический кроп", "Нет текущего захвата лица/круга, масштаб будет зафиксирован при следующем обнаружении лица.")
 
     def _on_dynamic_auto_center(self):
         for slider, value in (
@@ -3355,12 +3411,16 @@ class ChromaDialog(QDialog):
         face_found = bool(getattr(runtime, "face_found", False))
 
         if mode == "dynamic":
+            zoom_mode = str(getattr(self.owner.dynamic_crop, "zoom_mode", "locked") or "locked").lower()
+            if bool(getattr(self.owner.dynamic_crop, "auto_zoom_enabled", False)):
+                zoom_mode = "auto"
+            zoom_text = {"auto": "масштаб авто", "locked": "масштаб фиксирован", "manual": "масштаб ручной"}.get(zoom_mode, zoom_mode)
             if dyn_rect:
                 x, y, w, h = [int(v) for v in dyn_rect]
                 status = "лицо найдено" if face_found else "лицо потеряно, держим последнюю область"
-                self.crop_rect_lbl.setText(f"Динамический кроп: {x}, {y}, {w}×{h} · {status}")
+                self.crop_rect_lbl.setText(f"Динамический кроп: {x}, {y}, {w}×{h} · {status} · {zoom_text}")
             else:
-                self.crop_rect_lbl.setText("Динамический кроп: ждёт лицо")
+                self.crop_rect_lbl.setText(f"Динамический кроп: ждёт лицо · {zoom_text}")
             return
 
         if not manual_rect:
@@ -5154,14 +5214,24 @@ class RoundCamWindow(QWidget):
         self.act_crop_manual = QAction("Включен",              self, checkable=True)
         self.act_dynamic_crop = QAction("Динамический",         self, checkable=True)
         self.act_dynamic_crop.setToolTip("Автокомпозиция лица для плавающего окна. Ручной кроп не изменяет.")
+        self.act_dynamic_auto_zoom = QAction("Автозум", self, checkable=True)
+        self.act_dynamic_auto_zoom.setToolTip("Включено: масштаб следует за лицом. Выключено: лицо отслеживается, масштаб фиксирован.")
+        self.act_dynamic_lock_zoom = QAction("Зафиксировать масштаб сейчас", self)
         self.act_dynamic_debug = QAction("Показывать разметку динамического кропа", self, checkable=True)
         self.act_dynamic_reset = QAction("Сбросить параметры динамического кропа", self)
+        self.act_ptz_auto = QAction("Авто-PTZ Pan/Tilt", self, checkable=True)
         self.act_ptz_home_save = QAction("Запомнить базовое положение камеры и цели", self)
         self.act_ptz_home_reset = QAction("Вернуть камеру и цель к базе", self)
         self.act_target_left = QAction("← Цель", self)
         self.act_target_right = QAction("Цель →", self)
         self.act_target_up = QAction("↑ Цель", self)
         self.act_target_down = QAction("Цель ↓", self)
+        self.act_ptz_pan_left = QAction("Pan ←", self)
+        self.act_ptz_pan_right = QAction("Pan →", self)
+        self.act_ptz_tilt_up = QAction("Tilt ↑", self)
+        self.act_ptz_tilt_down = QAction("Tilt ↓", self)
+        self.act_ptz_zoom_in = QAction("Zoom +", self)
+        self.act_ptz_zoom_out = QAction("Zoom −", self)
         self.act_crop_enable = QAction("Кроп: вкл/выкл",       self, checkable=True)
         self.act_crop_pick   = QAction("Настройки кропа…",     self)
 
@@ -5206,27 +5276,35 @@ class RoundCamWindow(QWidget):
 
         # ---- Контекстное меню окна ----
         self.ctx_menu = QMenu(self)
-        self.ctx_menu.aboutToShow.connect(
-            lambda: self.ctx_menu.setWindowOpacity(self.chroma.ui_opacity))
+        self.ctx_menu.aboutToShow.connect(self._prepare_context_menu)
         self._fill_menu(self.ctx_menu, is_tray=False)
 
         # ---- Меню трея ----
         self.tray_act_show = QAction("Показать окно", self, checkable=True, checked=True)
         self.tray_act_show.toggled.connect(self._on_tray_show)
+        self.tray_status_camera = QAction("Камера: —", self)
+        self.tray_status_crop = QAction("Кроп: —", self)
+        self.tray_status_ptz = QAction("PTZ: —", self)
+        self.tray_status_vcam = QAction("VCam: —", self)
+        for _act in (self.tray_status_camera, self.tray_status_crop, self.tray_status_ptz, self.tray_status_vcam):
+            _act.setEnabled(False)
 
         self.tray_menu = QMenu(self)
-        self.tray_menu.aboutToShow.connect(
-            lambda: self.tray_menu.setWindowOpacity(self.chroma.ui_opacity))
+        self.tray_menu.aboutToShow.connect(self._prepare_tray_menu)
         self.tray_menu.addAction(self.tray_act_show)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction(self.tray_status_camera)
+        self.tray_menu.addAction(self.tray_status_crop)
+        self.tray_menu.addAction(self.tray_status_ptz)
+        self.tray_menu.addAction(self.tray_status_vcam)
+        self.tray_menu.addSeparator()
         self._fill_menu(self.tray_menu, is_tray=True)
 
         # ---- Трей ----
         self.tray = QSystemTrayIcon(self._icon, self)
         self.tray.setToolTip(APP_NAME)
         self.tray.setContextMenu(self.tray_menu)
-        self.tray.activated.connect(
-            lambda r: self.tray_menu.popup(QtGui.QCursor.pos())
-            if r in (QSystemTrayIcon.Trigger, QSystemTrayIcon.Context) else None)
+        self.tray.activated.connect(self._on_tray_icon_activated)
         self.tray.show()
 
         # ---- Подключение сигналов ----
@@ -5249,14 +5327,23 @@ class RoundCamWindow(QWidget):
         self.act_crop_off.triggered.connect(lambda checked=False: checked and self.set_crop_mode("off"))
         self.act_crop_manual.triggered.connect(lambda checked=False: checked and self.set_crop_mode("manual"))
         self.act_dynamic_crop.triggered.connect(lambda checked=False: checked and self.set_crop_mode("dynamic"))
+        self.act_dynamic_auto_zoom.toggled.connect(self.set_dynamic_auto_zoom)
+        self.act_dynamic_lock_zoom.triggered.connect(lambda checked=False: self.lock_dynamic_zoom_from_current(save=True, notify=True))
         self.act_dynamic_debug.toggled.connect(self.set_dynamic_debug_view)
         self.act_dynamic_reset.triggered.connect(self._dynamic_reset)
+        self.act_ptz_auto.toggled.connect(self.set_ptz_auto_enabled)
         self.act_ptz_home_save.triggered.connect(self._ptz_remember_home)
         self.act_ptz_home_reset.triggered.connect(self._reset_camera_and_target_to_home)
         self.act_target_left.triggered.connect(lambda: self._dynamic_arrow_nudge("x", -1))
         self.act_target_right.triggered.connect(lambda: self._dynamic_arrow_nudge("x", 1))
         self.act_target_up.triggered.connect(lambda: self._dynamic_arrow_nudge("y", -1))
         self.act_target_down.triggered.connect(lambda: self._dynamic_arrow_nudge("y", 1))
+        self.act_ptz_pan_left.triggered.connect(lambda: self._ptz_menu_physical("pan", -1))
+        self.act_ptz_pan_right.triggered.connect(lambda: self._ptz_menu_physical("pan", 1))
+        self.act_ptz_tilt_up.triggered.connect(lambda: self._ptz_menu_physical("tilt", -1))
+        self.act_ptz_tilt_down.triggered.connect(lambda: self._ptz_menu_physical("tilt", 1))
+        self.act_ptz_zoom_in.triggered.connect(lambda: self._ptz_menu_physical("zoom", 1))
+        self.act_ptz_zoom_out.triggered.connect(lambda: self._ptz_menu_physical("zoom", -1))
         self.act_crop_enable.toggled.connect(self.set_crop_enabled)
         self.act_crop_pick.triggered.connect(self._open_crop_settings)
         self.act_shape_circ.toggled.connect(
@@ -5277,10 +5364,11 @@ class RoundCamWindow(QWidget):
         self.set_always_on_top(self.state.always_on_top)
         self.set_window_mirror(self.state.window_mirror)
         self.set_click_through(self.state.click_through)
-        self.set_vcam_enabled(self.state.vcam_enabled)
+        self._set_action_checked(self.act_vcam_enable, self.state.vcam_enabled)
         self.set_vcam_mirror(self.state.vcam_mirror)
         self.set_chroma_enabled(self.chroma.enabled)
         self.set_crop_mode(self._current_crop_mode(), save=False)
+        self._sync_ptz_menu_actions()
         self._set_window_shape(self.state.window_shape)
         self.act_vcam_fill.setChecked(self.state.vcam_fit == "fill")
         self._update_cam_label()
@@ -5359,7 +5447,7 @@ class RoundCamWindow(QWidget):
         cfg = self.dynamic_crop
         if name in ("analysis_scale_percent", "min_face_size_full_frame", "vignette_panel_width"):
             value = int(value)
-        elif name in ("arrows_move_face", "invert_arrows_x", "invert_arrows_y", "show_debug_view"):
+        elif name in ("arrows_move_face", "invert_arrows_x", "invert_arrows_y", "show_debug_view", "auto_zoom_enabled"):
             value = bool(value)
         else:
             value = float(value)
@@ -5518,8 +5606,11 @@ class RoundCamWindow(QWidget):
         crop_m.addAction(self.act_crop_manual)
         crop_m.addAction(self.act_dynamic_crop)
         crop_m.addSeparator()
-        crop_m.addAction(self.act_crop_pick)
+        crop_m.addAction(self.act_dynamic_auto_zoom)
+        crop_m.addAction(self.act_dynamic_lock_zoom)
         crop_m.addAction(self.act_dynamic_debug)
+        crop_m.addSeparator()
+        crop_m.addAction(self.act_crop_pick)
 
         # === Виртуальная камера ===
         vcam_m = self._sub(menu, "Виртуальная камера")
@@ -5529,6 +5620,25 @@ class RoundCamWindow(QWidget):
 
         # === PTZ / цель ===
         ptz_m = self._sub(menu, "PTZ / цель")
+        target_m = self._sub(ptz_m, "Цель композиции")
+        target_m.addAction(self.act_target_left)
+        target_m.addAction(self.act_target_right)
+        target_m.addAction(self.act_target_up)
+        target_m.addAction(self.act_target_down)
+        target_m.addSeparator()
+        target_m.addAction(self.act_dynamic_lock_zoom)
+
+        phys_m = self._sub(ptz_m, "Физическая камера")
+        phys_m.addAction(self.act_ptz_pan_left)
+        phys_m.addAction(self.act_ptz_pan_right)
+        phys_m.addAction(self.act_ptz_tilt_up)
+        phys_m.addAction(self.act_ptz_tilt_down)
+        phys_m.addSeparator()
+        phys_m.addAction(self.act_ptz_zoom_in)
+        phys_m.addAction(self.act_ptz_zoom_out)
+
+        ptz_m.addSeparator()
+        ptz_m.addAction(self.act_ptz_auto)
         ptz_m.addAction(self.act_ptz_home_save)
         ptz_m.addAction(self.act_ptz_home_reset)
         ptz_m.addSeparator()
@@ -5632,39 +5742,118 @@ class RoundCamWindow(QWidget):
     # ------------------------------------------------------------------
     # Переключатели состояния
     # ------------------------------------------------------------------
-    def set_always_on_top(self, v: bool):
-        self.state.always_on_top = v
-        self.act_on_top.setChecked(v)
-        self._sync_chroma_dialog_vignette_controls()
-        flags = self._base_flags | (Qt.WindowStaysOnTopHint if v else 0)
-        self.setWindowFlags(flags)
-        # setWindowFlags прячет окно — показываем снова только если оно уже было видно
-        if self.isVisible():
-            self.show()
-        _logger.info("always_on_top=%s", v)
+    def _set_action_checked(self, act, value: bool):
+        if act is None:
+            return
+        try:
+            value = bool(value)
+            if act.isChecked() != value:
+                act.blockSignals(True)
+                act.setChecked(value)
+                act.blockSignals(False)
+        except RuntimeError:
+            pass
 
-    def set_window_mirror(self, v: bool):
-        self.state.window_mirror = v
-        self.act_mirror.setChecked(v)
-        self._sync_chroma_dialog_vignette_controls()
+    def _sync_tray_show_action(self):
+        act = getattr(self, "tray_act_show", None)
+        if act is None:
+            return
+        self._set_action_checked(act, self.isVisible())
 
-    def set_click_through(self, v: bool):
-        self.state.click_through = v
-        self.act_click_thru.setChecked(v)
-        self._sync_chroma_dialog_vignette_controls()
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, v)
-        if os.name == "nt":
-            WS_EX_LAYERED    = 0x00080000
+    def _apply_click_through_native(self):
+        enabled = bool(getattr(self.state, "click_through", False))
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, enabled)
+        if os.name != "nt":
+            return
+        try:
+            WS_EX_LAYERED = 0x00080000
             WS_EX_TRANSPARENT = 0x00000020
             GWL_EXSTYLE = -20
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            SWP_FRAMECHANGED = 0x0020
             user32 = ctypes.windll.user32
             hwnd = int(self.winId())
             style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED
-            if v: style |= WS_EX_TRANSPARENT
-            else: style &= ~WS_EX_TRANSPARENT
+            if enabled:
+                style |= WS_EX_TRANSPARENT
+            else:
+                style &= ~WS_EX_TRANSPARENT
             user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-        if self.isVisible():
+            user32.SetWindowPos(
+                hwnd, None, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+        except Exception as e:
+            _log_exc("Ошибка применения click-through", e)
+
+    def _apply_window_flags(self, *, force_show: bool | None = None):
+        was_visible = self.isVisible()
+        flags = self._base_flags
+        if bool(getattr(self.state, "always_on_top", False)):
+            flags |= Qt.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self._apply_click_through_native()
+
+        should_show = was_visible if force_show is None else bool(force_show)
+        if should_show:
             self.show()
+            self.raise_()
+            self.activateWindow()
+        self._sync_tray_show_action()
+
+    def _prepare_context_menu(self):
+        self.ctx_menu.setWindowOpacity(self.chroma.ui_opacity)
+        self._sync_crop_mode_actions()
+        self._sync_dynamic_menu_actions()
+        self._sync_ptz_menu_actions()
+
+    def _prepare_tray_menu(self):
+        self.tray_menu.setWindowOpacity(self.chroma.ui_opacity)
+        self._sync_tray_show_action()
+        self._sync_crop_mode_actions()
+        self._sync_dynamic_menu_actions()
+        self._sync_ptz_menu_actions()
+        try:
+            camera_name = self.camera_display_name(self.camera_index, include_props=False)
+            camera_state = "активна" if (self.cap and self.cap.isOpened()) else "выключена"
+            self.tray_status_camera.setText(f"Камера: {camera_name} · {camera_state}")
+
+            crop_mode = self._current_crop_mode()
+            if crop_mode == "dynamic":
+                zoom = self._dynamic_zoom_mode()
+                zoom_text = {"auto": "автозум", "locked": "масштаб фиксирован", "manual": "ручной масштаб"}.get(zoom, zoom)
+                crop_text = f"динамический · {zoom_text}"
+            elif crop_mode == "manual":
+                crop_text = "ручной"
+            else:
+                crop_text = "выключен"
+            self.tray_status_crop.setText(f"Кроп: {crop_text}")
+            self.tray_status_ptz.setText(f"PTZ: {'авто Pan/Tilt' if bool(getattr(self.ptz, 'enabled', False)) else 'выключен/ручной'}")
+            self.tray_status_vcam.setText(f"VCam: {'включена' if bool(getattr(self.state, 'vcam_enabled', False)) else 'выключена'}")
+        except Exception:
+            pass
+
+    def set_always_on_top(self, v: bool):
+        self.state.always_on_top = bool(v)
+        self._set_action_checked(self.act_on_top, self.state.always_on_top)
+        self._sync_chroma_dialog_vignette_controls()
+        self._apply_window_flags()
+        _logger.info("always_on_top=%s", self.state.always_on_top)
+
+    def set_window_mirror(self, v: bool):
+        self.state.window_mirror = bool(v)
+        self._set_action_checked(self.act_mirror, self.state.window_mirror)
+        self._sync_chroma_dialog_vignette_controls()
+
+    def set_click_through(self, v: bool):
+        self.state.click_through = bool(v)
+        self._set_action_checked(self.act_click_thru, self.state.click_through)
+        self._sync_chroma_dialog_vignette_controls()
+        self._apply_click_through_native()
 
     def set_vcam_enabled(self, v: bool):
         if getattr(self, "_shutdown_started", False):
@@ -5685,12 +5874,12 @@ class RoundCamWindow(QWidget):
             self.save_config()
 
     def set_vcam_mirror(self, v: bool):
-        self.state.vcam_mirror = v
-        self.act_vcam_mirror.setChecked(v)
+        self.state.vcam_mirror = bool(v)
+        self._set_action_checked(self.act_vcam_mirror, self.state.vcam_mirror)
 
     def set_chroma_enabled(self, v: bool):
-        self.chroma.enabled = v
-        self.act_chroma.setChecked(v)
+        self.chroma.enabled = bool(v)
+        self._set_action_checked(self.act_chroma, self.chroma.enabled)
 
     def _current_crop_mode(self) -> str:
         """Три взаимоисключающих режима кропа для окна."""
@@ -5743,11 +5932,125 @@ class RoundCamWindow(QWidget):
             except RuntimeError:
                 pass
 
+        auto_act = getattr(self, "act_dynamic_auto_zoom", None)
+        if auto_act is not None:
+            try:
+                value = bool(getattr(self.dynamic_crop, "auto_zoom_enabled", False)) or str(getattr(self.dynamic_crop, "zoom_mode", "locked") or "locked").lower() == "auto"
+                self._set_action_checked(auto_act, value)
+            except RuntimeError:
+                pass
+
+        lock_act = getattr(self, "act_dynamic_lock_zoom", None)
+        if lock_act is not None:
+            try:
+                lock_act.setEnabled(bool(getattr(self.dynamic_crop, "enabled", False)))
+            except RuntimeError:
+                pass
+
+    def _sync_ptz_menu_actions(self):
+        self._set_action_checked(getattr(self, "act_ptz_auto", None), bool(getattr(self.ptz, "enabled", False)))
+
+    def _sync_dynamic_dialog_zoom_controls(self):
+        dlg = getattr(self, "_chroma_dlg", None)
+        if dlg is None:
+            return
+        try:
+            if hasattr(dlg, "dynamic_auto_zoom_chk"):
+                dlg.dynamic_auto_zoom_chk.blockSignals(True)
+                dlg.dynamic_auto_zoom_chk.setChecked(bool(getattr(self.dynamic_crop, "auto_zoom_enabled", False)) or str(getattr(self.dynamic_crop, "zoom_mode", "locked") or "locked").lower() == "auto")
+                dlg.dynamic_auto_zoom_chk.blockSignals(False)
+            if hasattr(dlg, "_update_crop_label"):
+                dlg._update_crop_label()
+        except (RuntimeError, AttributeError):
+            self._chroma_dlg = None
+
     def set_dynamic_debug_view(self, value: bool):
         self.dynamic_crop.show_debug_view = bool(value)
         self._sync_dynamic_menu_actions()
         if self.chroma.persist:
             self.save_config()
+
+    def _dynamic_current_diameter_ratio(self) -> float | None:
+        runtime = getattr(self, "_dynamic_crop_runtime", None)
+        circle = getattr(runtime, "circle", None)
+        frame = getattr(self, "last_frame_bgr", None)
+        if frame is None:
+            frame = getattr(self, "_pending_frame_bgr", None)
+        if circle is None or frame is None:
+            return None
+        try:
+            h, w = frame.shape[:2]
+            ref = max(1.0, float(min(w, h)))
+            ratio = float(circle.diameter) / ref
+            if np.isfinite(ratio) and ratio > 0:
+                return float(clamp(ratio, 0.05, 2.0))
+        except Exception:
+            pass
+        return None
+
+    def lock_dynamic_zoom_from_current(self, save: bool = True, notify: bool = False) -> bool:
+        ratio = self._dynamic_current_diameter_ratio()
+        got_current = ratio is not None
+        if ratio is None:
+            ratio = getattr(self.dynamic_crop, "locked_diameter_ratio", None)
+        try:
+            ratio = None if ratio is None else float(ratio)
+        except Exception:
+            ratio = None
+        if ratio is not None and np.isfinite(ratio) and ratio > 0:
+            self.dynamic_crop.locked_diameter_ratio = float(clamp(ratio, 0.05, 2.0))
+        self.dynamic_crop.auto_zoom_enabled = False
+        self.dynamic_crop.zoom_mode = "locked"
+        self._sync_dynamic_menu_actions()
+        self._sync_dynamic_dialog_zoom_controls()
+        if notify and not got_current:
+            QMessageBox.information(self, "Динамический кроп", "Текущий масштаб пока не найден. Он будет зафиксирован при следующем захвате лица.")
+        if save and self.chroma.persist:
+            self.save_config()
+        return got_current
+
+    def set_dynamic_auto_zoom(self, value: bool, save: bool = True):
+        value = bool(value)
+        if value:
+            self.dynamic_crop.auto_zoom_enabled = True
+            self.dynamic_crop.zoom_mode = "auto"
+        else:
+            self.lock_dynamic_zoom_from_current(save=False, notify=False)
+            self.dynamic_crop.auto_zoom_enabled = False
+            self.dynamic_crop.zoom_mode = "locked"
+        self._sync_dynamic_menu_actions()
+        self._sync_dynamic_dialog_zoom_controls()
+        if save and self.chroma.persist:
+            self.save_config()
+
+    def set_ptz_auto_enabled(self, value: bool):
+        self.ptz.enabled = bool(value)
+        self._sync_ptz_menu_actions()
+        dlg = getattr(self, "_chroma_dlg", None)
+        if dlg is not None:
+            try:
+                dlg.ptz_enabled_chk.blockSignals(True)
+                dlg.ptz_enabled_chk.setChecked(self.ptz.enabled)
+                dlg.ptz_enabled_chk.blockSignals(False)
+                dlg._update_ptz_status()
+            except (RuntimeError, AttributeError):
+                self._chroma_dlg = None
+        if self.chroma.persist:
+            self.save_config()
+
+    def _ptz_menu_physical(self, axis: str, direction: int):
+        if axis == "pan":
+            ok = self._ptz_pan(int(direction), reason="menu physical")
+        elif axis == "tilt":
+            ok = self._ptz_tilt(int(direction), reason="menu physical")
+        elif axis == "zoom":
+            ok = self._ptz_zoom(int(direction), reason="menu physical")
+        else:
+            ok = False
+        self._sync_dynamic_settings_dialog()
+        if not ok:
+            _logger.warning("PTZ menu command refused: %s %s", axis, direction)
+        return ok
 
     def set_crop_mode(self, mode: str, save: bool = True):
         """Единая точка переключения: выключен / ручной / динамический.
@@ -5783,8 +6086,8 @@ class RoundCamWindow(QWidget):
 
     def _set_window_shape(self, shape: str):
         self.state.window_shape = shape
-        self.act_shape_circ.setChecked(shape == "circle")
-        self.act_shape_sq.setChecked(shape == "square")
+        self._set_action_checked(self.act_shape_circ, shape == "circle")
+        self._set_action_checked(self.act_shape_sq, shape == "square")
         self._update_mask(); self.update()
 
     # ------------------------------------------------------------------
@@ -5984,18 +6287,23 @@ class RoundCamWindow(QWidget):
     # ------------------------------------------------------------------
     # Показ/скрытие окна из трея
     # ------------------------------------------------------------------
+    def _on_tray_icon_activated(self, reason):
+        if reason == QSystemTrayIcon.Trigger:
+            wanted = not self.isVisible()
+            self._set_action_checked(self.tray_act_show, wanted)
+            self._on_tray_show(wanted)
+
     def _on_tray_show(self, checked: bool):
         if getattr(self, "_shutdown_started", False):
             return
         if checked:
-            flags = self._base_flags | (Qt.WindowStaysOnTopHint if self.state.always_on_top else 0)
-            self.setWindowFlags(flags)
-            self.show(); self.raise_(); self.activateWindow()
+            self._apply_window_flags(force_show=True)
             self._ensure_frame_source()
             if self.state.vcam_enabled:
                 self._start_vcam()
         else:
             self.hide()
+            self._sync_tray_show_action()
             self._release_frame_source_if_idle()
         self._update_cam_label()
 
@@ -6009,7 +6317,7 @@ class RoundCamWindow(QWidget):
             QMessageBox.warning(self, "pyvirtualcam не установлен",
                                 "Установите pyvirtualcam и драйвер.")
             self.state.vcam_enabled = False
-            self.act_vcam_enable.setChecked(False)
+            self._set_action_checked(self.act_vcam_enable, False)
             return
         if self.vcam is None:
             if not (self.cap and self.cap.isOpened()):
@@ -6040,7 +6348,7 @@ class RoundCamWindow(QWidget):
                 QMessageBox.critical(self, "Ошибка", f"Виртуальная камера:\n{e}")
                 self.vcam = None
                 self.state.vcam_enabled = False
-                self.act_vcam_enable.setChecked(False)
+                self._set_action_checked(self.act_vcam_enable, False)
 
     def _stop_vcam(self):
         if self.vcam is not None:
@@ -6100,8 +6408,13 @@ class RoundCamWindow(QWidget):
 
         current = None
         try:
-            with getattr(self, "_cap_lock", threading.RLock()):
+            lock = getattr(self, "_cap_lock", threading.RLock())
+            if not lock.acquire(timeout=0.25):
+                raise TimeoutError("camera lock busy")
+            try:
                 raw_current = float(cap.get(prop))
+            finally:
+                lock.release()
             if np.isfinite(raw_current):
                 current = raw_current
         except Exception:
@@ -6120,8 +6433,13 @@ class RoundCamWindow(QWidget):
 
         target = base + float(direction) * step
         try:
-            with getattr(self, "_cap_lock", threading.RLock()):
+            lock = getattr(self, "_cap_lock", threading.RLock())
+            if not lock.acquire(timeout=0.25):
+                raise TimeoutError("camera lock busy")
+            try:
                 ok = bool(cap.set(prop, float(target)))
+            finally:
+                lock.release()
         except Exception as e:
             self._ptz_runtime.last_error = f"{axis}: {e}"
             return False
@@ -6139,8 +6457,15 @@ class RoundCamWindow(QWidget):
         )
         if not ok:
             self._ptz_runtime.last_error = self._ptz_runtime.last_command
+            self._ptz_runtime.failed_commands = int(getattr(self._ptz_runtime, "failed_commands", 0)) + 1
+            if str(reason).startswith("auto") or "edge" in str(reason) or "focus" in str(reason):
+                if self._ptz_runtime.failed_commands >= 3:
+                    self.ptz.enabled = False
+                    self._ptz_runtime.last_error = "auto-PTZ отключён: драйвер не принимает команды"
+                    self._sync_ptz_menu_actions()
         else:
             self._ptz_runtime.last_error = ""
+            self._ptz_runtime.failed_commands = 0
         dlg = getattr(self, "_chroma_dlg", None)
         if dlg is not None:
             try:
@@ -6167,8 +6492,13 @@ class RoundCamWindow(QWidget):
         if cap is None or not cap.isOpened() or prop is None:
             return None
         try:
-            with getattr(self, "_cap_lock", threading.RLock()):
+            lock = getattr(self, "_cap_lock", threading.RLock())
+            if not lock.acquire(timeout=0.25):
+                return None
+            try:
                 value = float(cap.get(prop))
+            finally:
+                lock.release()
         except Exception:
             return None
         if not np.isfinite(value):
@@ -6187,8 +6517,13 @@ class RoundCamWindow(QWidget):
             self._ptz_runtime.last_error = f"{axis}: камера/свойство недоступно"
             return False
         try:
-            with getattr(self, "_cap_lock", threading.RLock()):
+            lock = getattr(self, "_cap_lock", threading.RLock())
+            if not lock.acquire(timeout=0.25):
+                raise TimeoutError("camera lock busy")
+            try:
                 ok = bool(cap.set(prop, float(value)))
+            finally:
+                lock.release()
         except Exception as e:
             self._ptz_runtime.last_error = f"{axis}: {e}"
             return False
@@ -6409,6 +6744,12 @@ class RoundCamWindow(QWidget):
             face_roi_margin=float(getattr(cfg, "face_roi_margin", 2.8)),
             detector_min_neighbors=int(getattr(cfg, "detector_min_neighbors", 4)),
             return_after_lost_frames=int(globals().get("DYNAMIC_CROP_RETURN_AFTER_LOST_FRAMES", 18)),
+            auto_zoom_enabled=bool(getattr(cfg, "auto_zoom_enabled", False)),
+            zoom_mode=str(getattr(cfg, "zoom_mode", "locked") or "locked"),
+            locked_diameter_ratio=getattr(cfg, "locked_diameter_ratio", None),
+            manual_diameter_ratio=float(getattr(cfg, "manual_diameter_ratio", 0.42)),
+            auto_zoom_min_ratio=float(getattr(cfg, "auto_zoom_min_ratio", 0.18)),
+            auto_zoom_max_ratio=float(getattr(cfg, "auto_zoom_max_ratio", 0.80)),
         )
 
     def _sync_dynamic_runtime_from_director(self, result):
@@ -6417,7 +6758,14 @@ class RoundCamWindow(QWidget):
         def box_to_dynamic_box(box):
             if box is None:
                 return None
-            return DynamicBox(float(box.x), float(box.y), float(box.w), float(box.h))
+            return DynamicBox(
+                float(box.x), float(box.y), float(box.w), float(box.h),
+                None if getattr(box, "anchor_x", None) is None else float(getattr(box, "anchor_x")),
+                None if getattr(box, "anchor_y", None) is None else float(getattr(box, "anchor_y")),
+                None if getattr(box, "scale_size", None) is None else float(getattr(box, "scale_size")),
+                str(getattr(box, "scale_source", "face")),
+                None if getattr(box, "ipd", None) is None else float(getattr(box, "ipd")),
+            )
 
         def circle_to_dynamic_circle(circle):
             if circle is None:
@@ -6578,9 +6926,44 @@ class RoundCamWindow(QWidget):
 
         return detect_in_region(frame, 0, 0, previous)
 
-    def _dynamic_circle_from_face(self, face: DynamicBox) -> DynamicCircleState:
+    def _dynamic_zoom_mode(self) -> str:
+        raw = str(getattr(self.dynamic_crop, "zoom_mode", "locked") or "locked").lower()
+        if bool(getattr(self.dynamic_crop, "auto_zoom_enabled", False)):
+            raw = "auto"
+        if raw not in ("auto", "locked", "manual"):
+            raw = "auto" if bool(getattr(self.dynamic_crop, "auto_zoom_enabled", False)) else "locked"
+        return raw
+
+    def _dynamic_diameter_from_face(self, face: DynamicBox, frame_shape) -> float:
         cfg = self.dynamic_crop
-        diameter = max(40.0, face.size * float(cfg.circle_to_head))
+        h, w = frame_shape[:2]
+        ref = max(1.0, float(min(w, h)))
+        mode = self._dynamic_zoom_mode()
+        if mode == "manual":
+            return max(40.0, ref * clamp(float(getattr(cfg, "manual_diameter_ratio", 0.42)), 0.05, 2.0))
+        raw = max(40.0, face.size * float(cfg.circle_to_head))
+        if mode == "locked":
+            ratio = getattr(cfg, "locked_diameter_ratio", None)
+            try:
+                ratio = None if ratio is None else float(ratio)
+            except Exception:
+                ratio = None
+            if ratio is not None and np.isfinite(ratio) and ratio > 0:
+                return max(40.0, ref * clamp(ratio, 0.05, 2.0))
+            runtime = getattr(self, "_dynamic_crop_runtime", None)
+            circle = getattr(runtime, "circle", None)
+            if circle is not None:
+                return max(40.0, float(circle.diameter))
+            return raw
+        lo = ref * clamp(float(getattr(cfg, "auto_zoom_min_ratio", 0.18)), 0.02, 1.5)
+        hi = ref * clamp(float(getattr(cfg, "auto_zoom_max_ratio", 0.80)), 0.05, 2.5)
+        if hi < lo:
+            lo, hi = hi, lo
+        return float(clamp(raw, lo, hi))
+
+    def _dynamic_circle_from_face(self, face: DynamicBox, frame_shape) -> DynamicCircleState:
+        cfg = self.dynamic_crop
+        diameter = self._dynamic_diameter_from_face(face, frame_shape)
         cx = (face.cx
               - float(getattr(cfg, "offset_x", 0.0)) * diameter
               + float(getattr(cfg, "circle_offset_x", 0.0)) * diameter)
@@ -6781,6 +7164,7 @@ class RoundCamWindow(QWidget):
         cv2.putText(
             out,
             f"dynamic crop: {status} | head={self.dynamic_crop.circle_to_head:.2f} "
+            f"zoom={self._dynamic_zoom_mode()} "
             f"off=({self.dynamic_crop.offset_x:+.2f},{self.dynamic_crop.offset_y:+.2f}) "
             f"zone={getattr(self.dynamic_crop, 'center_dead_zone', DEFAULT_DYNAMIC_CENTER_DEAD_ZONE):.2f} "
             f"analysis={self.dynamic_crop.analysis_scale_percent}%",
@@ -6926,7 +7310,7 @@ class RoundCamWindow(QWidget):
             runtime.lost_frames = 0
 
             face = self._dynamic_smooth_box(runtime.face, detected_face)
-            target_circle = self._dynamic_circle_from_face(face)
+            target_circle = self._dynamic_circle_from_face(face, frame.shape)
             stable_circle = self._dynamic_apply_center_dead_zone(runtime.circle, target_circle, face)
             circle = self._dynamic_smooth_circle(runtime.circle, stable_circle)
             rect = self._dynamic_crop_rect_from_circle(circle)
@@ -7947,8 +8331,7 @@ class RoundCamWindow(QWidget):
         """Возвращает callable для действия hid. Используется внутри
         _apply_hotkeys, когда тип привязки 'shortcut' (без QAction)."""
         callbacks = {
-            "vcam_toggle":   lambda: (self._dynamic_toggle_debug_view() or
-                                       self.set_vcam_enabled(not self.state.vcam_enabled)),
+            "vcam_toggle":   lambda: self.set_vcam_enabled(not self.state.vcam_enabled),
             "vcam_mirror":   lambda: self.set_vcam_mirror(not self.state.vcam_mirror),
             "window_mirror": lambda: self.set_window_mirror(not self.state.window_mirror),
             "scale_up":      lambda: self._scale_circle(1),
@@ -7963,6 +8346,8 @@ class RoundCamWindow(QWidget):
             "dynamic_analysis_down_alt": lambda: self._dynamic_adjust_analysis(-DYNAMIC_CROP_ANALYSIS_STEP),
             "dynamic_analysis_up_alt":   lambda: self._dynamic_adjust_analysis(DYNAMIC_CROP_ANALYSIS_STEP),
             "dynamic_reset": lambda: self._reset_camera_and_target_to_home(),
+            "dynamic_auto_zoom_toggle": lambda: self.set_dynamic_auto_zoom(not bool(getattr(self.dynamic_crop, "auto_zoom_enabled", False))),
+            "dynamic_lock_zoom": lambda: self.lock_dynamic_zoom_from_current(save=True, notify=True),
         }
         return callbacks.get(hid)
 
@@ -8377,6 +8762,24 @@ class RoundCamWindow(QWidget):
         # Старые поля синхронизируем, чтобы fallback-логика не жила своей жизнью.
         d.smoothing = d.position_smoothing
         d.center_dead_zone = d.position_dead_zone
+        d.auto_zoom_enabled = _as_bool(getattr(d, "auto_zoom_enabled", False), False)
+        d.zoom_mode = str(getattr(d, "zoom_mode", "locked") or "locked").lower()
+        if d.auto_zoom_enabled:
+            d.zoom_mode = "auto"
+        if d.zoom_mode not in ("auto", "locked", "manual"):
+            d.zoom_mode = "auto" if d.auto_zoom_enabled else "locked"
+        d.auto_zoom_enabled = (d.zoom_mode == "auto")
+        ratio = getattr(d, "locked_diameter_ratio", None)
+        try:
+            ratio = None if ratio is None else float(ratio)
+        except Exception:
+            ratio = None
+        d.locked_diameter_ratio = None if ratio is None or not np.isfinite(ratio) or ratio <= 0 else _clamp_float(ratio, 0.42, 0.05, 2.0)
+        d.manual_diameter_ratio = _clamp_float(getattr(d, "manual_diameter_ratio", 0.42), 0.42, 0.05, 2.0)
+        d.auto_zoom_min_ratio = _clamp_float(getattr(d, "auto_zoom_min_ratio", 0.18), 0.18, 0.02, 1.5)
+        d.auto_zoom_max_ratio = _clamp_float(getattr(d, "auto_zoom_max_ratio", 0.80), 0.80, 0.05, 2.5)
+        if d.auto_zoom_max_ratio < d.auto_zoom_min_ratio:
+            d.auto_zoom_min_ratio, d.auto_zoom_max_ratio = d.auto_zoom_max_ratio, d.auto_zoom_min_ratio
         d.tracking_mode = str(getattr(d, "tracking_mode", "eyes_ipd") or "eyes_ipd").lower()
         if d.tracking_mode not in ("eyes_ipd", "face_box"):
             d.tracking_mode = "eyes_ipd"
@@ -8549,6 +8952,16 @@ class RoundCamWindow(QWidget):
                     dc.scale_dead_zone = 0.08
                 if "tracking_mode" not in raw_dynamic:
                     dc.tracking_mode = "eyes_ipd"
+                # v0.8 preview: старые config.json не знали про автозум,
+                # значит динамический кроп вёл себя как auto. Сохраняем
+                # совместимость, но новые конфиги получают locked по умолчанию.
+                if "auto_zoom_enabled" not in raw_dynamic and "zoom_mode" not in raw_dynamic:
+                    if bool(getattr(dc, "enabled", False)):
+                        dc.auto_zoom_enabled = True
+                        dc.zoom_mode = "auto"
+                    else:
+                        dc.auto_zoom_enabled = False
+                        dc.zoom_mode = "locked"
             except Exception:
                 pass
 
@@ -8682,6 +9095,13 @@ class RoundCamWindow(QWidget):
         self._stop_capture_loop(release=True, log=True)
 
         try:
+            director = getattr(self, "_face_director", None)
+            if director is not None and hasattr(director, "close"):
+                director.close()
+        except Exception as e:
+            _log_exc("Ошибка закрытия FaceAutoDirector", e)
+
+        try:
             cv2.destroyAllWindows()
         except Exception:
             pass
@@ -8793,10 +9213,15 @@ def main():
     w = RoundCamWindow(args)
     app.aboutToQuit.connect(w._cleanup_resources)
     if args.start_hidden:
-        w.tray_act_show.setChecked(False)
+        w._set_action_checked(w.tray_act_show, False)
+        w.hide()
     else:
-        w.tray_act_show.setChecked(True)
-        w.show(); w.raise_(); w.activateWindow()
+        w._apply_window_flags(force_show=True)
+        w._ensure_frame_source()
+    if w.state.vcam_enabled:
+        w.set_vcam_enabled(True)
+    elif args.start_hidden:
+        w._release_frame_source_if_idle()
 
     exit_code = app.exec_()
     w._cleanup_resources()
