@@ -1,3 +1,11 @@
+<<<<<<< Updated upstream
+=======
+
+/* 
+Встроенный стиль v3: интегрирован из пользовательского style.qss.
+Если рядом с программой лежит внешний style.qss, он по-прежнему имеет приоритет.
+*/
+>>>>>>> Stashed changes
 /*
 style.qss — тема КругоЗор в визуальной логике CalcNumLock / Win11 Calculator.
 
@@ -610,3 +618,7 @@ QTabWidget#SettingsTabs QScrollArea {
     background: transparent;
     border: none;
 }
+<<<<<<< Updated upstream
+=======
+
+>>>>>>> Stashed changes

@@ -47,6 +47,7 @@ class FaceDirectorConfig:
     detector_min_neighbors: int = 4
     return_after_lost_frames: int = 18
 
+<<<<<<< Updated upstream
     # Preview / UX build: scale control is explicit now.
     # auto  : current behaviour, diameter follows detected face/IPD size.
     # locked: face position is tracked, but crop diameter stays fixed.
@@ -58,6 +59,8 @@ class FaceDirectorConfig:
     auto_zoom_min_ratio: float = 0.18
     auto_zoom_max_ratio: float = 0.80
 
+=======
+>>>>>>> Stashed changes
     # Rough anthropometric projection: head/face width from interpupillary distance.
     # It is not medical geometry, just a stable video-composition estimate.
     ipd_to_head: float = 2.65
@@ -116,8 +119,11 @@ class FaceDirectorResult:
     detector_backend: str = "none"
     landmarks: Optional[list[tuple[float, float]]] = None
     scale_source: str = "none"
+<<<<<<< Updated upstream
     zoom_mode: str = "locked"
     auto_zoom_enabled: bool = False
+=======
+>>>>>>> Stashed changes
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -157,6 +163,7 @@ class FaceAutoDirector:
         self._last_landmarks = []
         self._last_scale_source = "none"
 
+<<<<<<< Updated upstream
     def close(self) -> None:
         mesh = self._mp_face_mesh
         self._mp_face_mesh = None
@@ -172,6 +179,12 @@ class FaceAutoDirector:
             self.face_found = False
             self._last_scale_source = "disabled" if cfg is not None and not bool(getattr(cfg, "enabled", False)) else "none"
             return self._empty_result(cfg)
+=======
+    def process(self, frame_bgr: np.ndarray, cfg: FaceDirectorConfig) -> FaceDirectorResult:
+        self.processed_frames += 1
+        if frame_bgr is None or frame_bgr.size == 0 or not bool(cfg.enabled):
+            return self._result(None, None)
+>>>>>>> Stashed changes
 
         detected_face = self._detect_face(frame_bgr, cfg)
 
@@ -181,7 +194,11 @@ class FaceAutoDirector:
             self.lost_frames = 0
 
             self.face = self._smooth_box(self.face, detected_face, cfg)
+<<<<<<< Updated upstream
             self.target_circle = self._circle_from_face(self.face, cfg, frame_bgr.shape)
+=======
+            self.target_circle = self._circle_from_face(self.face, cfg)
+>>>>>>> Stashed changes
             self.stable_circle = self._apply_dead_zones(self.circle, self.target_circle, self.face, cfg)
             self.circle = self._smooth_circle(self.circle, self.stable_circle, cfg)
             self.crop_rect = self._crop_rect_from_circle(self.circle, cfg)
@@ -222,6 +239,7 @@ class FaceAutoDirector:
             detector_backend=str(self._last_backend),
             landmarks=list(self._last_landmarks) if self._last_landmarks else None,
             scale_source=str(self._last_scale_source),
+<<<<<<< Updated upstream
             zoom_mode=self._zoom_mode(cfg) if cfg is not None else "locked",
             auto_zoom_enabled=bool(getattr(cfg, "auto_zoom_enabled", False)) if cfg is not None else False,
         )
@@ -235,6 +253,8 @@ class FaceAutoDirector:
             scale_source=str(self._last_scale_source),
             zoom_mode=self._zoom_mode(cfg) if cfg is not None else "locked",
             auto_zoom_enabled=bool(getattr(cfg, "auto_zoom_enabled", False)) if cfg is not None else False,
+=======
+>>>>>>> Stashed changes
         )
 
     @staticmethod
@@ -277,6 +297,7 @@ class FaceAutoDirector:
     def _scale_dead(cfg: FaceDirectorConfig) -> float:
         return float(_clamp(float(getattr(cfg, "scale_dead_zone", 0.08)), 0.0, 0.50))
 
+<<<<<<< Updated upstream
     @staticmethod
     def _zoom_mode(cfg: Optional[FaceDirectorConfig]) -> str:
         if cfg is None:
@@ -317,6 +338,8 @@ class FaceAutoDirector:
             lo, hi = hi, lo
         return float(_clamp(raw, lo, hi))
 
+=======
+>>>>>>> Stashed changes
     def _ensure_mediapipe(self):
         if self._mediapipe_failed:
             return None
@@ -613,8 +636,15 @@ class FaceAutoDirector:
             _lerp(old.diameter, new.diameter, kz),
         )
 
+<<<<<<< Updated upstream
     def _circle_from_face(self, face: FaceBox, cfg: FaceDirectorConfig, frame_shape) -> CircleState:
         diameter = self._diameter_from_face(face, cfg, frame_shape)
+=======
+    @staticmethod
+    def _circle_from_face(face: FaceBox, cfg: FaceDirectorConfig) -> CircleState:
+        base_size = face.size
+        diameter = max(40.0, base_size * float(cfg.circle_to_head))
+>>>>>>> Stashed changes
         cx = face.cx - float(cfg.offset_x) * diameter + float(cfg.circle_offset_x) * diameter
         cy = face.cy - float(cfg.offset_y) * diameter + float(cfg.circle_offset_y) * diameter
         return CircleState(cx, cy, diameter)
@@ -766,7 +796,11 @@ class FaceAutoDirector:
         scale_src = self._last_scale_source
         text = (
             f"director: {'FACE' if self.face_found else 'LAST / NO FACE'} | {self._last_backend} | "
+<<<<<<< Updated upstream
             f"mode={self._mode(cfg)} zoom={self._zoom_mode(cfg)} scale={scale_src} "
+=======
+            f"mode={self._mode(cfg)} scale={scale_src} "
+>>>>>>> Stashed changes
             f"posSmooth={self._pos_alpha(cfg):.2f} scaleSmooth={self._scale_alpha(cfg):.2f} "
             f"posZone={self._pos_dead(cfg):.2f} scaleZone={self._scale_dead(cfg):.2f}"
         )
