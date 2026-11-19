@@ -1,50 +1,66 @@
 @echo off
-setlocal ENABLEDELAYEDEXPANSION
-chcp 65001 >nul
+setlocal
+pushd "%~dp0" || exit /b 1
 
 set "PYTHON=py"
 set "SCRIPT=KruGoZor.pyw"
 set "APPNAME=KruGoZor"
 set "ICON=icon.ico"
 
-if not exist "%SCRIPT%" (
-  echo [ERROR] %SCRIPT% not found.
-  pause
-  exit /b 1
+if /i "%~1"=="launcher" (
+  if not exist "dist" mkdir "dist"
+  "%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe ^
+    /platform:anycpu /optimize+ /codepage:65001 /win32icon:icon.ico ^
+    /reference:System.Windows.Forms.dll /reference:System.Drawing.dll ^
+    /out:"dist\KruGoZor-lite-launcher.exe" "LiteLauncher.cs" || goto :failed
+  echo [OK] Build finished: dist\KruGoZor-lite-launcher.exe
+  popd
+  exit /b 0
 )
 
-echo ============= KrugoZor build =============
-%PYTHON% -m pip install --upgrade pip
-%PYTHON% -m pip install --upgrade pyinstaller
-%PYTHON% -m pip install -r requirements.txt
+for %%F in ("%SCRIPT%" "%ICON%" "style.qss" "face_landmarker.task" "selfie_segmenter.tflite") do (
+  if not exist "%%~F" (
+    echo [ERROR] Missing file: %%~F
+    goto :failed
+  )
+)
 
-rmdir /s /q build 2>nul
-rmdir /s /q dist 2>nul
-del /q "%APPNAME%.spec" 2>nul
+%PYTHON% -c "import PyInstaller, mediapipe" || (
+  echo [ERROR] PyInstaller and MediaPipe are required in the build interpreter.
+  goto :failed
+)
 
-set "ICON_ARG="
-if exist "%ICON%" set "ICON_ARG=--icon %ICON%"
+if /i "%~1"=="lite" (
+  %PYTHON% -m PyInstaller --noconfirm "KruGoZor-lite.spec" || goto :failed
+  if not exist "dist\KruGoZor-lite.exe" goto :failed
+  echo [OK] Build finished: dist\KruGoZor-lite.exe
+  popd
+  exit /b 0
+)
 
 %PYTHON% -m PyInstaller ^
   --noconfirm ^
-  --clean ^
   --onefile ^
   --windowed ^
   --name "%APPNAME%" ^
-  %ICON_ARG% ^
+  --icon "%ICON%" ^
   --hidden-import PyQt5.sip ^
   --collect-submodules keyboard ^
   --collect-submodules psutil ^
   --collect-submodules pyvirtualcam ^
   --collect-submodules cv2 ^
+  --collect-all mediapipe ^
   --add-data "style.qss;." ^
-  "%SCRIPT%"
+  --add-data "face_landmarker.task;." ^
+  --add-data "selfie_segmenter.tflite;." ^
+  "%SCRIPT%" || goto :failed
 
-if exist dist (
-  if exist "style.qss" copy /y "style.qss" "dist\style.qss" >nul
-  if exist "%ICON%" copy /y "%ICON%" "dist\%ICON%" >nul
-)
-
-echo.
+if not exist "dist\%APPNAME%.exe" goto :failed
 echo [OK] Build finished: dist\%APPNAME%.exe
-pause
+popd
+exit /b 0
+
+:failed
+echo [ERROR] Build failed.
+popd
+exit /b 1

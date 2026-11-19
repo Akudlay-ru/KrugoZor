@@ -175,3 +175,10 @@ __marimo__/
 config.json
 Logs/
 Snapshots/
+
+# Reproducible lightweight build
+!/KruGoZor-lite.spec
+
+# MediaPipe models downloaded by fetch_models.py
+/face_landmarker.task
+/selfie_segmenter.tflite

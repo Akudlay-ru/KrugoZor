@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import hypot
+from pathlib import Path
+import sys
 from typing import Optional
 
 import cv2
@@ -40,6 +42,8 @@ class FaceDirectorConfig:
     offset_y: float = -0.07
     circle_offset_x: float = 0.0
     circle_offset_y: float = -0.07
+    auto_composition: bool = False
+    composition_profile: str = "shoulders"
     return_speed: float = 0.0
     show_debug_view: bool = False
     fast_roi_tracking: bool = True
@@ -136,6 +140,7 @@ class FaceAutoDirector:
         self._haar_failed = False
         self._mp = None
         self._mp_face_mesh = None
+        self._mp_tasks_mode = False
         self._mediapipe_failed = False
         self._last_backend = "none"
         self._last_landmarks: list[tuple[float, float]] = []
@@ -183,7 +188,7 @@ class FaceAutoDirector:
             self.face = self._smooth_box(self.face, detected_face, cfg)
             self.target_circle = self._circle_from_face(self.face, cfg, frame_bgr.shape)
             self.stable_circle = self._apply_dead_zones(self.circle, self.target_circle, self.face, cfg)
-            self.circle = self._smooth_circle(self.circle, self.stable_circle, cfg)
+            self.circle = self._constrain_circle(self._smooth_circle(self.circle, self.stable_circle, cfg), frame_bgr.shape)
             self.crop_rect = self._crop_rect_from_circle(self.circle, cfg)
             self.face_found = True
             self._last_scale_source = self.face.scale_source
@@ -193,7 +198,7 @@ class FaceAutoDirector:
             if self.circle is not None and self.lost_frames >= int(_clamp(cfg.return_after_lost_frames, 1, 120)):
                 returned = self._return_circle_to_frame_center(frame_bgr, self.circle, cfg)
                 self.stable_circle = returned
-                self.circle = self._smooth_circle(self.circle, returned, cfg)
+                self.circle = self._constrain_circle(self._smooth_circle(self.circle, returned, cfg), frame_bgr.shape)
                 self.crop_rect = self._crop_rect_from_circle(self.circle, cfg)
 
         return self._result(frame_bgr, cfg)
@@ -325,13 +330,28 @@ class FaceAutoDirector:
         try:
             import mediapipe as mp  # type: ignore
             self._mp = mp
-            self._mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=1,
-                refine_landmarks=True,
-                min_detection_confidence=0.50,
-                min_tracking_confidence=0.50,
-            )
+            if hasattr(mp, "solutions"):
+                self._mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+                    static_image_mode=False,
+                    max_num_faces=1,
+                    refine_landmarks=True,
+                    min_detection_confidence=0.50,
+                    min_tracking_confidence=0.50,
+                )
+                self._mp_tasks_mode = False
+            else:
+                model_path = Path(__file__).resolve().with_name("face_landmarker.task")
+                if getattr(sys, "frozen", False) and not model_path.is_file():
+                    model_path = Path(sys.executable).resolve().with_name(model_path.name)
+                options = mp.tasks.vision.FaceLandmarkerOptions(
+                    base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
+                    num_faces=1,
+                    min_face_detection_confidence=0.50,
+                    min_face_presence_confidence=0.50,
+                    min_tracking_confidence=0.50,
+                )
+                self._mp_face_mesh = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+                self._mp_tasks_mode = True
             return self._mp_face_mesh
         except Exception:
             self._mediapipe_failed = True
@@ -393,15 +413,19 @@ class FaceAutoDirector:
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
         try:
-            result = mesh.process(rgb)
+            if self._mp_tasks_mode:
+                image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+                result = mesh.detect(image)
+            else:
+                result = mesh.process(rgb)
         except Exception:
             return None
 
-        faces = getattr(result, "multi_face_landmarks", None)
+        faces = getattr(result, "face_landmarks" if self._mp_tasks_mode else "multi_face_landmarks", None)
         if not faces:
             return None
 
-        face_landmarks = faces[0].landmark
+        face_landmarks = faces[0] if self._mp_tasks_mode else faces[0].landmark
         sh, sw = small.shape[:2]
         pts = []
         for lm in face_landmarks:
@@ -434,11 +458,13 @@ class FaceAutoDirector:
                 if 0 <= idx < len(face_landmarks):
                     lm = face_landmarks[idx]
                     acc.append((float(lm.x) * sw / scale_factor,
-                                float(lm.y) * sh / scale_factor))
+                                float(lm.y) * sh / scale_factor,
+                                float(lm.z) * sw / scale_factor))
             if not acc:
                 return None
             return (sum(p[0] for p in acc) / len(acc),
-                    sum(p[1] for p in acc) / len(acc))
+                    sum(p[1] for p in acc) / len(acc),
+                    sum(p[2] for p in acc) / len(acc))
 
         left_eye = center_of(left_eye_indices)
         right_eye = center_of(right_eye_indices)
@@ -446,7 +472,8 @@ class FaceAutoDirector:
         ipd = None
         eye_anchor = None
         if left_eye is not None and right_eye is not None:
-            ipd = hypot(left_eye[0] - right_eye[0], left_eye[1] - right_eye[1])
+            ipd = hypot(left_eye[0] - right_eye[0], left_eye[1] - right_eye[1],
+                        left_eye[2] - right_eye[2])
             if 8.0 <= ipd <= max(16.0, float(w) * 0.65):
                 eye_anchor = ((left_eye[0] + right_eye[0]) / 2.0,
                               (left_eye[1] + right_eye[1]) / 2.0)
@@ -455,8 +482,15 @@ class FaceAutoDirector:
 
         if mode == "eyes_ipd" and eye_anchor is not None:
             anchor_x, anchor_y = eye_anchor
+            # При повороте центр глаз смещается к носу. Середина боковых
+            # ориентиров головы лучше сохраняет центр относительно шеи.
+            head_sides = center_of([234, 454])
+            if head_sides is not None:
+                anchor_x = head_sides[0]
             if ipd is not None:
-                scale_size = float(ipd) * float(getattr(cfg, "ipd_to_head", 2.65))
+                # Учитываем оценку глубины точек: при повороте плоская
+                # проекция расстояния между глазами сокращается.
+                scale_size = max(float(ipd) * float(getattr(cfg, "ipd_to_head", 2.65)), bw, bh)
                 scale_source = "ipd"
             else:
                 scale_size = max(bw, bh)
@@ -615,15 +649,43 @@ class FaceAutoDirector:
 
     def _circle_from_face(self, face: FaceBox, cfg: FaceDirectorConfig, frame_shape) -> CircleState:
         diameter = self._diameter_from_face(face, cfg, frame_shape)
-        cx = face.cx - float(cfg.offset_x) * diameter + float(cfg.circle_offset_x) * diameter
-        cy = face.cy - float(cfg.offset_y) * diameter + float(cfg.circle_offset_y) * diameter
+        offset_x, offset_y = self._composition_offsets(cfg)
+        cx = face.cx - offset_x * diameter
+        cy = face.cy - offset_y * diameter
+        if bool(getattr(cfg, "auto_composition", False)):
+            # Оценка макушки от линии глаз с дополнительным запасом для
+            # волос и мягкого края. Настоящую линию волос FaceMesh не видит.
+            estimated_hair_top = face.cy - 0.85 * float(face.size)
+            cy = min(cy, estimated_hair_top - 0.05 * diameter + diameter / 2.0)
+        return self._constrain_circle(CircleState(cx, cy, diameter), frame_shape)
+
+    @staticmethod
+    def _constrain_circle(circle: CircleState, frame_shape) -> CircleState:
+        height, width = frame_shape[:2]
+        # За пределами кадра прозрачный padding срезает видимую окружность.
+        diameter = min(float(circle.diameter), max(1.0, float(min(width, height) - 2)))
+        radius = diameter / 2.0
+        cx = _clamp(float(circle.cx), radius + 1.0, float(width) - radius - 1.0)
+        cy = _clamp(float(circle.cy), radius + 1.0, float(height) - radius - 1.0)
         return CircleState(cx, cy, diameter)
 
     @staticmethod
+    def _composition_offsets(cfg: FaceDirectorConfig) -> tuple[float, float]:
+        x = float(cfg.offset_x) - float(cfg.circle_offset_x)
+        y = float(cfg.offset_y) - float(cfg.circle_offset_y)
+        if bool(getattr(cfg, "auto_composition", False)):
+            # Значения для круглой виньетки, а не для прямоугольного кадра;
+            # портрет с плечами откалиброван по выбранному пользователем виду.
+            eye_line = {"head": 0.43, "shoulders": 0.38, "torso": 0.34}.get(getattr(cfg, "composition_profile", "shoulders"), 0.38)
+            y += eye_line - 0.5
+        return x, y
+
+    @staticmethod
     def _target_face_point(circle: CircleState, cfg: FaceDirectorConfig) -> tuple[float, float]:
+        offset_x, offset_y = FaceAutoDirector._composition_offsets(cfg)
         return (
-            float(circle.cx) + (float(cfg.offset_x) - float(cfg.circle_offset_x)) * float(circle.diameter),
-            float(circle.cy) + (float(cfg.offset_y) - float(cfg.circle_offset_y)) * float(circle.diameter),
+            float(circle.cx) + offset_x * float(circle.diameter),
+            float(circle.cy) + offset_y * float(circle.diameter),
         )
 
     def _apply_dead_zones(
@@ -648,12 +710,20 @@ class FaceAutoDirector:
         else:
             center_limit = max(1.0, float(current.diameter) * pos_zone_ratio)
             desired_face_cx, desired_face_cy = self._target_face_point(current, cfg)
-            dx = float(face.cx - desired_face_cx)
-            dy = float(face.cy - desired_face_cy)
+            if bool(getattr(cfg, "auto_composition", False)):
+                dx = float(target.cx - current.cx)
+                dy = float(target.cy - current.cy)
+            else:
+                dx = float(face.cx - desired_face_cx)
+                dy = float(face.cy - desired_face_cy)
             if abs(dx) > center_limit:
-                cx += dx - (center_limit if dx > 0 else -center_limit)
+                cx += dx if bool(getattr(cfg, "auto_composition", False)) else dx - (center_limit if dx > 0 else -center_limit)
+            elif bool(getattr(cfg, "auto_composition", False)) and abs(dx) > 1.0:
+                cx += dx * 0.15
             if abs(dy) > center_limit:
-                cy += dy - (center_limit if dy > 0 else -center_limit)
+                cy += dy if bool(getattr(cfg, "auto_composition", False)) else dy - (center_limit if dy > 0 else -center_limit)
+            elif bool(getattr(cfg, "auto_composition", False)) and abs(dy) > 1.0:
+                cy += dy * 0.15
 
         if scale_zone_ratio <= 0.0:
             diameter = float(target.diameter)

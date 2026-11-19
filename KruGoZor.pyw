@@ -316,7 +316,13 @@ def _data_dir() -> str:
 DATA_DIR    = _data_dir()
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 LOG_FILE    = os.path.join(DATA_DIR, "Logs", "krugozor.log")
-STYLE_FILE  = os.path.join(_app_dir(), "style.qss")
+def _bundled_asset(name: str) -> Path:
+    external = Path(_app_dir()) / name
+    if external.is_file():
+        return external
+    return Path(__file__).resolve().with_name(name)
+
+STYLE_FILE  = str(_bundled_asset("style.qss"))
 
 _logger = None
 
@@ -509,6 +515,8 @@ class CameraCaptureLoop(QtCore.QObject):
 
     def set_capture(self, cap, camera_index: int, fps: int) -> None:
         self.stop_capture(release=False, wait=True)
+        if self.is_running():
+            raise RuntimeError("Предыдущий поток захвата камеры ещё не остановился")
         self._cap = cap
         self._camera_index = int(camera_index)
         self._fps = max(1, int(fps or 30))
@@ -526,6 +534,8 @@ class CameraCaptureLoop(QtCore.QObject):
         th = self._thread
         if wait and th is not None and th.is_alive() and th is not threading.current_thread():
             th.join(timeout=1.2)
+        if th is not None and th.is_alive():
+            return
         self._thread = None
         if release:
             acquired = self._lock.acquire(timeout=0.25)
@@ -635,6 +645,7 @@ class ChromaConfig:
     Это позволяет одной картинкой подавлять, например, и зелёный фон,
     и куски синей кофты — параллельно."""
     enabled:    bool  = True
+    hybrid_enabled: bool = False
     picks:      list  = None       # 4 × PickSlot — заполняется в __post_init__
     use_hsv:    bool  = True
     h_min:      int   = 70
@@ -685,6 +696,36 @@ class CropConfig:
         if self.rect is None:
             self.rect = [70, 33, 514, 437]
 
+def _normalize_composition_presets(value):
+    """Возвращает три допустимых пресета, сохраняя корректные настройки."""
+    import math
+    defaults = {"head": (2.25, 0.0), "shoulders": (2.50, 0.0), "torso": (3.00, 0.0)}
+    old_defaults = {"head": (1.80, 0.08), "shoulders": (2.80, -0.10), "torso": (3.70, -0.18)}
+    value = value if isinstance(value, dict) else {}
+    result = {}
+    for key, (size, offset) in defaults.items():
+        item = value.get(key, {})
+        item = item if isinstance(item, dict) else {}
+        if "dynamic_crop" not in item:
+            old_size, old_offset = old_defaults[key]
+            if item.get("circle_to_head") == old_size and item.get("offset_y") == old_offset:
+                item = {}
+        parsed = []
+        for name, default, lo, hi in (("circle_to_head", size, 1.0, 4.0), ("offset_y", offset, -0.5, 0.5)):
+            try:
+                number = float(item.get(name, default))
+                if not math.isfinite(number):
+                    number = default
+            except (TypeError, ValueError, OverflowError):
+                number = default
+            parsed.append(max(lo, min(hi, number)))
+        result[key] = {"circle_to_head": parsed[0], "offset_y": parsed[1]}
+        if item.get("mode") in ("off", "manual", "dynamic") and isinstance(item.get("crop"), dict) and isinstance(item.get("dynamic_crop"), dict):
+            result[key]["mode"] = item["mode"]
+            result[key]["crop"] = dict(item["crop"])
+            result[key]["dynamic_crop"] = {k: v for k, v in item["dynamic_crop"].items() if k != "composition_presets"}
+    return result
+
 @dataclass
 class DynamicCropConfig:
     """Изолированная сущность автокомпозиции.
@@ -694,6 +735,9 @@ class DynamicCropConfig:
     остаются на старом пайплайне.
     """
     enabled: bool = False
+    composition_presets: dict = field(default_factory=lambda: _normalize_composition_presets(None))
+    auto_composition: bool = False
+    composition_profile: str = "shoulders"
     # Положение лица внутри круга: эти параметры двигают стрелки.
     offset_x: float = 0.0
     offset_y: float = -0.14
@@ -847,6 +891,8 @@ class PTZConfig:
 @dataclass
 class PTZRuntimeState:
     cooldown: int = 0
+    auto_intent: dict = field(default_factory=dict)
+    auto_settle_until: float = 0.0
     last_pan: float | None = None
     last_tilt: float | None = None
     last_zoom: float | None = None
@@ -919,8 +965,9 @@ class AppState:
     vcam_passthrough_native: bool = False
 
     # Путь к подложке виртуальной камеры. В режиме "circle" это нижний
-    # слой: по умолчанию белый фон, при выборе файла — картинка-подложка.
+    # слой: по умолчанию портретный фон, при выборе файла — картинка-подложка.
     vcam_bg_path:    str   = ""
+    vcam_builtin_bg: str = "gradient"
 
     # Цвет слоя аватарки для режима "circle". Это НЕ нижняя подложка,
     # а верхняя плашка с круглым вырезом. У Телемоста фон аватарки
@@ -1695,6 +1742,26 @@ HOTKEY_DEFINITIONS = (
 DEFAULT_HOTKEYS = {hid: seq for hid, _t, seq, _k, _a in HOTKEY_DEFINITIONS}
 
 
+def _apply_dark_title_bar(window):
+    """Согласует системный заголовок Windows с тёмной темой окна."""
+    if os.name != "nt":
+        return
+    try:
+        hwnd = ctypes.c_void_p(int(window.winId()))
+        dwm = ctypes.windll.dwmapi.DwmSetWindowAttribute
+        dark = ctypes.c_int(1)
+        result = dwm(hwnd, 20, ctypes.byref(dark), ctypes.sizeof(dark))
+        if result != 0:
+            dwm(hwnd, 19, ctypes.byref(dark), ctypes.sizeof(dark))
+        # Windows 11: явный цвет заголовка и текста, независимо от системной темы.
+        caption = ctypes.c_uint(0x001E1E1E)
+        foreground = ctypes.c_uint(0x00EEEEEE)
+        dwm(hwnd, 35, ctypes.byref(caption), ctypes.sizeof(caption))
+        dwm(hwnd, 36, ctypes.byref(foreground), ctypes.sizeof(foreground))
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 class ChromaDialog(QDialog):
     """Единое окно настроек: камера, хромакей, кроп, виньетка и виртуальная камера."""
 
@@ -1704,6 +1771,7 @@ class ChromaDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("КругоЗор — Хромакей / Виньетка / Кроп / Виртуальная камера")
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        _apply_dark_title_bar(self)
         self.setModal(False)
         self.setStyleSheet(STYLE_QSS)
         self.resize(980, 760)
@@ -1736,12 +1804,14 @@ class ChromaDialog(QDialog):
         font = self.enabled_chk.font()
         font.setBold(True)
         self.enabled_chk.setFont(font)
+        self.hybrid_chk = QCheckBox("Гибридный хромакей: MediaPipe + цвет")
+        self.hybrid_chk.setToolTip("Нейросеть выделяет человека, а цветовая маска уточняет границу. Работает локально.")
 
         self._slot_widgets = []
         for i in range(4):
             chk = QCheckBox()
             pick_btn = QPushButton(self.PICK_LABELS[i])
-            pick_btn.setToolTip(f"Выбрать цвет пипетки {self.PICK_LABELS[i]}")
+            pick_btn.setToolTip(f"Выбрать точку фона для пипетки {self.PICK_LABELS[i]}. Цвет обновляется при изменении освещения; если точку закрывает человек, обновление приостанавливается.")
             swatch = QLabel()
             swatch.setFixedSize(22, 22)
             rgb_lbl = QLabel("-")
@@ -1827,7 +1897,7 @@ class ChromaDialog(QDialog):
         self.crop_reset_btn = QPushButton("Сбросить кроп")
         self.crop_capture_btn = QPushButton("Взять весь кадр")
         self.crop_off_rb = QtWidgets.QRadioButton("Выключен")
-        self.crop_manual_rb = QtWidgets.QRadioButton("Включен")
+        self.crop_manual_rb = QtWidgets.QRadioButton("Ручной")
         self.crop_dynamic_rb = QtWidgets.QRadioButton("Динамический")
         self.crop_mode_group = QtWidgets.QButtonGroup(self)
         self.crop_mode_group.setExclusive(True)
@@ -1864,7 +1934,7 @@ class ChromaDialog(QDialog):
         self.dynamic_tracking_mode_combo.setToolTip("Глаза + IPD: позиция по центру между глазами, масштаб сначала по межзрачковому расстоянию; Рамка лица: старая логика по размеру лица.")
 
         self.dynamic_auto_zoom_chk = QCheckBox("Автозум")
-        self.dynamic_auto_zoom_chk.setToolTip("Если выключено, динамический кроп следит за лицом, но не меняет масштаб. Наконец-то кто-то поставил тормоз этой карусели.")
+        self.dynamic_auto_zoom_chk.setToolTip("Если выключено, динамический кроп следит за лицом, но не меняет масштаб.")
         self.dynamic_lock_zoom_btn = QPushButton("Зафиксировать масштаб")
         self.dynamic_lock_zoom_btn.setToolTip("Запомнить текущий диаметр динамического кропа и отключить автозум.")
 
@@ -2042,27 +2112,25 @@ class ChromaDialog(QDialog):
         self.vcam_mode_combo.addItem("Простая подкладка", "background")
         self.vcam_mode_combo.addItem("Как в Телемост", "circle")
 
+        self.vcam_builtin_combo = QtWidgets.QComboBox()
+        self.vcam_builtin_combo.addItem("Портретный градиент", "gradient")
+        self.vcam_builtin_combo.addItem("Белый фон", "white")
         self.vcam_bg_path_lbl = QLabel("Фон: не выбран")
         self.vcam_bg_path_lbl.setWordWrap(True)
         self.vcam_bg_path_lbl.setStyleSheet("color:#aeb7c2;")
         self.vcam_bg_load_btn = QPushButton("Выбрать подложку…")
         self.vcam_bg_telemost_btn = QPushButton("Для Телемоста")
-        self.vcam_bg_clear_btn = QPushButton("Сброс")
+        self.vcam_bg_clear_btn = QPushButton("Убрать файл")
 
         self.vcam_avatar_bg_lbl = QLabel("Фон аватарки: #202128")
         self.vcam_avatar_bg_lbl.setStyleSheet("color:#aeb7c2;")
         self.vcam_avatar_bg_color_btn = QPushButton("Цвет аватарки…")
 
-        self.vcam_auto_chk = QCheckBox("Авто-детект круга при загрузке")
         self.vcam_cx_spin = QSpinBox(); self.vcam_cx_spin.setRange(0, 9999)
         self.vcam_cy_spin = QSpinBox(); self.vcam_cy_spin.setRange(0, 9999)
         self.vcam_cr_sld = QSlider(Qt.Horizontal); self.vcam_cr_sld.setRange(1, 9999)
         self.vcam_cr_spin = QSpinBox(); self.vcam_cr_spin.setRange(1, 9999)
-        self.vcam_redetect_btn = QPushButton("Найти круг повторно")
 
-        self.vcam_start_btn = QPushButton("Запустить")
-        self.vcam_stop_btn = QPushButton("Остановить")
-        self.vcam_restart_btn = QPushButton("Перезапустить")
         self.vcam_status_lbl = QLabel("")
         self.vcam_status_lbl.setStyleSheet("color:#aeb7c2;")
 
@@ -2101,16 +2169,16 @@ class ChromaDialog(QDialog):
         root.addLayout(preview_tools_row)
 
         preview_row = QHBoxLayout()
-        main_preview_box = QGroupBox("1. Главный предпросмотр")
+        main_preview_box = QGroupBox("Кадр камеры")
         mp = QVBoxLayout(main_preview_box)
         mp.addWidget(self.preview_label, 1)
         preview_row.addWidget(main_preview_box, 3)
 
         side_preview_col = QVBoxLayout()
-        vig_box = QGroupBox("2. Превью виньетки")
+        vig_box = QGroupBox("Плавающее окно")
         vig_lay = QVBoxLayout(vig_box)
         vig_lay.addWidget(self.vignette_preview_lbl)
-        vcam_prev_box = QGroupBox("3. Превью виртуальной камеры")
+        vcam_prev_box = QGroupBox("Выход виртуальной камеры")
         vcp_lay = QVBoxLayout(vcam_prev_box)
         vcp_lay.addWidget(self.vcam_preview_lbl)
         side_preview_col.addWidget(vig_box)
@@ -2146,6 +2214,7 @@ class ChromaDialog(QDialog):
         self.camera_rename_btn.clicked.connect(self._on_camera_rename)
 
         self.enabled_chk.toggled.connect(self._on_enabled_toggled)
+        self.hybrid_chk.toggled.connect(self._on_hybrid_toggled)
         for i, (chk, pick_btn, _swatch, _rgb_lbl, tol_sld, tol_spin) in enumerate(self._slot_widgets):
             chk.toggled.connect(lambda v, idx=i: self._on_slot_enabled(idx, v))
             pick_btn.clicked.connect(lambda _=False, idx=i: self._begin_pick(idx))
@@ -2232,11 +2301,12 @@ class ChromaDialog(QDialog):
         self.vcam_vignette_size_sld.valueChanged.connect(self._on_vcam_vignette_size)
         self.vcam_mode_combo.currentIndexChanged.connect(self._on_vcam_mode_combo)
         self.vcam_bg_load_btn.clicked.connect(self._on_vcam_load_bg)
+        self.vcam_builtin_combo.activated.connect(self._on_vcam_builtin_bg)
         self.vcam_bg_telemost_btn.clicked.connect(self._on_vcam_telemost_bg)
         self.vcam_bg_clear_btn.clicked.connect(self._on_vcam_clear_bg)
         self.vcam_avatar_bg_color_btn.clicked.connect(self._on_vcam_avatar_bg_color)
-        self.vcam_cx_spin.valueChanged.connect(lambda v: setattr(self.owner.state, "vcam_circle_x", int(v)))
-        self.vcam_cy_spin.valueChanged.connect(lambda v: setattr(self.owner.state, "vcam_circle_y", int(v)))
+        self.vcam_cx_spin.valueChanged.connect(lambda v: self._set_vcam_circle_center("x", v))
+        self.vcam_cy_spin.valueChanged.connect(lambda v: self._set_vcam_circle_center("y", v))
         self.vcam_cr_sld.valueChanged.connect(self._on_vcam_circle_r_changed)
         self.vcam_cr_spin.valueChanged.connect(self._on_vcam_circle_r_changed)
 
@@ -2275,11 +2345,48 @@ class ChromaDialog(QDialog):
         lay.addStretch(1)
         return self._scroll_area(page)
 
+    def _build_composition_presets_panel(self) -> QGroupBox:
+        box = QGroupBox("Пресеты кропа")
+        layout = QVBoxLayout(box)
+        row = QHBoxLayout()
+        self.composition_preset_combo = QtWidgets.QComboBox()
+        for label, key in (("Только голова", "head"), ("Голова и плечи", "shoulders"), ("Голова и часть торса", "torso")):
+            self.composition_preset_combo.addItem(label, key)
+        self.composition_preset_combo.setToolTip("Выберите пресет, затем примените его или сохраните в него текущие настройки кропа.")
+        apply_btn = QPushButton("Применить")
+        save_btn = QPushButton("Сохранить текущий")
+        save_btn.setToolTip("Сохраняет режим, рамку и все параметры динамического кропа в выбранный пресет.")
+        row.addWidget(self.composition_preset_combo, 1)
+        row.addWidget(apply_btn)
+        row.addWidget(save_btn)
+        layout.addLayout(row)
+        self.composition_preset_status = QLabel("Сохраняются режим, рамка и настройки динамического кропа")
+        self.composition_preset_status.setWordWrap(True)
+        self.composition_preset_status.setStyleSheet("color:#aeb7c2;")
+        layout.addWidget(self.composition_preset_status)
+        apply_btn.clicked.connect(self._apply_selected_composition_preset)
+        save_btn.clicked.connect(self._save_selected_composition_preset)
+        if self.owner is None:
+            box.setEnabled(False)
+        return box
+
+    def _apply_selected_composition_preset(self):
+        if self.owner is not None:
+            self.owner._apply_composition_preset(self.composition_preset_combo.currentData())
+            self.composition_preset_status.setText("Применён пресет: " + self.composition_preset_combo.currentText())
+
+    def _save_selected_composition_preset(self):
+        if self.owner is not None:
+            self.owner._save_composition_preset(self.composition_preset_combo.currentData())
+            message = "Сохранён пресет: " if self.chroma.persist else "Сохранён на время сеанса: "
+            self.composition_preset_status.setText(message + self.composition_preset_combo.currentText())
+
     def _build_chroma_panel(self) -> QGroupBox:
         box = QGroupBox("Хромакей")
         root = QVBoxLayout(box)
         root.setSpacing(7)
         root.addWidget(self.enabled_chk)
+        root.addWidget(self.hybrid_chk)
 
         slots_widget = QWidget(box)
         sl = QGridLayout(slots_widget)
@@ -2415,11 +2522,12 @@ class ChromaDialog(QDialog):
         dl.addWidget(btn_widget, row, 0, 1, 3)
 
         root.addWidget(mode_row, 0, 0, 1, 2)
-        root.addWidget(self.crop_rect_lbl, 1, 0, 1, 2)
-        root.addWidget(dynamic_box, 2, 0, 1, 2)
-        root.addWidget(self.crop_hint_lbl, 3, 0, 1, 2)
-        root.addWidget(self.crop_capture_btn, 4, 0)
-        root.addWidget(self.crop_reset_btn, 4, 1)
+        root.addWidget(self._build_composition_presets_panel(), 1, 0, 1, 2)
+        root.addWidget(self.crop_rect_lbl, 2, 0, 1, 2)
+        root.addWidget(dynamic_box, 3, 0, 1, 2)
+        root.addWidget(self.crop_hint_lbl, 4, 0, 1, 2)
+        root.addWidget(self.crop_capture_btn, 5, 0)
+        root.addWidget(self.crop_reset_btn, 5, 1)
         return box
 
     def _add_ptz_slider_row(self, layout: QGridLayout, row: int,
@@ -2511,27 +2619,48 @@ class ChromaDialog(QDialog):
         root.addWidget(self.vcam_circle_overlay_chk, row, 0, 1, 4)
         row += 1
         root.addWidget(QLabel("Режим вывода"), row, 0)
-        root.addWidget(self.vcam_mode_combo, row, 1, 1, 3)
+        root.addWidget(self.vcam_mode_combo, row, 1, 1, 2)
+        root.addWidget(self.vcam_bg_telemost_btn, row, 3)
         row += 1
         root.addWidget(QLabel("Фон / подложка"), row, 0)
-        root.addWidget(self.vcam_bg_load_btn, row, 1)
-        root.addWidget(self.vcam_bg_telemost_btn, row, 2)
+        root.addWidget(self.vcam_builtin_combo, row, 1)
+        root.addWidget(self.vcam_bg_load_btn, row, 2)
         root.addWidget(self.vcam_bg_clear_btn, row, 3)
         row += 1
         root.addWidget(self.vcam_bg_path_lbl, row, 0, 1, 4)
         row += 1
-        root.addWidget(QLabel("Фон аватарки"), row, 0)
-        root.addWidget(self.vcam_avatar_bg_lbl, row, 1, 1, 2)
+        root.addWidget(self.vcam_scale_lbl, row, 0)
+        root.addWidget(self.vcam_scale_sld, row, 1, 1, 3)
+        row += 1
+        root.addWidget(self.vcam_vignette_size_lbl, row, 0)
+        root.addWidget(self.vcam_vignette_size_sld, row, 1, 1, 3)
+        row += 1
+        root.addWidget(self.vcam_avatar_bg_lbl, row, 0, 1, 3)
         root.addWidget(self.vcam_avatar_bg_color_btn, row, 3)
         row += 1
-        root.addWidget(QLabel("Круг X"), row, 0)
+        root.addWidget(QLabel("Центр круга X"), row, 0)
         root.addWidget(self.vcam_cx_spin, row, 1)
         root.addWidget(QLabel("Y"), row, 2)
         root.addWidget(self.vcam_cy_spin, row, 3)
         row += 1
-        root.addWidget(QLabel("R"), row, 0)
-        self.vcam_cr_sld.setToolTip(f"R: {self.vcam_cr_sld.value()}")
-        root.addWidget(self.vcam_cr_sld, row, 1, 1, 3)
+        root.addWidget(QLabel("Радиус круга"), row, 0)
+        root.addWidget(self.vcam_cr_sld, row, 1, 1, 2)
+        root.addWidget(self.vcam_cr_spin, row, 3)
+        tips = {
+            self.vcam_bg_telemost_btn: "Применяет размер и положение круга, масштаб портрета и цвет плитки для Телемоста.",
+            self.vcam_builtin_combo: "Подложка за человеком. В режиме Телемоста видна внутри круга.",
+            self.vcam_bg_clear_btn: "Убрать изображение и вернуться к встроенной подложке.",
+            self.vcam_scale_sld: "Меняет масштаб изображения внутри кадра виртуальной камеры.",
+            self.vcam_vignette_size_sld: "Меняет размер круглой виньетки при включённом круглом крае.",
+            self.vcam_circle_overlay_chk: "Круглый край для режимов «Без фона» и «Простая подкладка». В Телемосте круг задаётся радиусом.",
+            self.vcam_avatar_bg_color_btn: "Цвет плитки вокруг круга в режиме Телемоста.",
+            self.vcam_cx_spin: "Горизонтальная координата центра круга.",
+            self.vcam_cy_spin: "Вертикальная координата центра круга.",
+            self.vcam_cr_sld: "Радиус видимого круга в режиме Телемоста.",
+            self.vcam_cr_spin: "Точное значение радиуса круга.",
+        }
+        for widget, tip in tips.items():
+            widget.setToolTip(tip)
         root.setColumnStretch(3, 1)
         return box
 
@@ -2630,6 +2759,9 @@ class ChromaDialog(QDialog):
         self.enabled_chk.blockSignals(True)
         self.enabled_chk.setChecked(bool(c.enabled))
         self.enabled_chk.blockSignals(False)
+        self.hybrid_chk.blockSignals(True)
+        self.hybrid_chk.setChecked(bool(getattr(c, "hybrid_enabled", False)))
+        self.hybrid_chk.blockSignals(False)
 
         for i, slot in enumerate(c.picks):
             chk, _pick_btn, _swatch, _rgb_lbl, tol_sld, tol_spin = self._slot_widgets[i]
@@ -2898,8 +3030,7 @@ class ChromaDialog(QDialog):
         pairs = ((self.vcam_enabled_chk, st.vcam_enabled),
                  (self.vcam_mirror_chk, st.vcam_mirror),
                  (self.vcam_native_chk, st.vcam_passthrough_native),
-                 (self.vcam_circle_overlay_chk, st.vcam_circle_overlay),
-                 (self.vcam_auto_chk, st.vcam_circle_auto))
+                 (self.vcam_circle_overlay_chk, st.vcam_circle_overlay))
         for w, val in pairs:
             w.blockSignals(True)
             w.setChecked(bool(val))
@@ -3137,11 +3268,12 @@ class ChromaDialog(QDialog):
     def _refresh_slot_visual(self, idx: int):
         slot = self.chroma.picks[idx]
         _chk, _btn, swatch, rgb_lbl, _tol_sld, _tol_spin = self._slot_widgets[idx]
-        if slot.color is None:
+        color = getattr(self.owner, "_live_pick_colors", {}).get(idx, slot.color) if self.owner is not None else slot.color
+        if color is None:
             swatch.setStyleSheet("background:#555; border:1px solid #777;")
             rgb_lbl.setText(f"{self.PICK_LABELS[idx]}: -")
         else:
-            r, g, b = slot.color
+            r, g, b = (int(round(v)) for v in color)
             swatch.setStyleSheet(f"background:rgb({r},{g},{b}); border:1px solid #777;")
             rgb_lbl.setText(f"{self.PICK_LABELS[idx]}: ({r}, {g}, {b})")
 
@@ -3199,6 +3331,19 @@ class ChromaDialog(QDialog):
             self.owner.set_chroma_enabled(bool(value))
         else:
             self.chroma.enabled = bool(value)
+
+    def _on_hybrid_toggled(self, value: bool):
+        if value and (self.owner is None or self.owner._ensure_hybrid_segmenter() is None):
+            self.hybrid_chk.blockSignals(True)
+            self.hybrid_chk.setChecked(False)
+            self.hybrid_chk.blockSignals(False)
+            QMessageBox.warning(self, "Гибридный хромакей", "Не удалось загрузить модель MediaPipe. Проверьте файл selfie_segmenter.tflite и журнал программы.")
+            return
+        self.chroma.hybrid_enabled = bool(value)
+        if value and not self.enabled_chk.isChecked():
+            self.enabled_chk.setChecked(True)
+        if self.owner is not None and self.chroma.persist:
+            self.owner.save_config()
 
     def _on_slot_enabled(self, idx: int, value: bool):
         self.chroma.picks[idx].enabled = bool(value)
@@ -3443,8 +3588,15 @@ class ChromaDialog(QDialog):
         if self.owner is None:
             return
         path = self.owner.state.vcam_bg_path or ""
+        combo = self.vcam_builtin_combo
+        if path and combo.findData("file") < 0:
+            combo.addItem("Изображение из файла", "file")
+        elif not path and combo.findData("file") >= 0:
+            combo.removeItem(combo.findData("file"))
+        combo.setCurrentIndex(combo.findData("file" if path else self.owner.state.vcam_builtin_bg))
+        self._update_vcam_native_dependents()
         if not path:
-            self.vcam_bg_path_lbl.setText("Подложка: белый фон")
+            self.vcam_bg_path_lbl.setText("Подложка: " + combo.currentText())
             self.vcam_bg_path_lbl.setStyleSheet("color:#aeb7c2;")
         elif not os.path.exists(path):
             self.vcam_bg_path_lbl.setText(f"Подложка: файл не найден\n{path}")
@@ -3538,6 +3690,7 @@ class ChromaDialog(QDialog):
         if self.owner is None:
             return
         self.owner.state.vcam_circle_overlay = bool(value)
+        self._update_vcam_native_dependents()
         self.owner._circle_mask_cache.clear()
         if self.owner.chroma.persist:
             self.owner.save_config()
@@ -3559,12 +3712,26 @@ class ChromaDialog(QDialog):
 
     def _update_vcam_native_dependents(self):
         active = not self.vcam_native_chk.isChecked()
-        for w in (self.vcam_mode_combo, self.vcam_circle_overlay_chk,
-                  self.vcam_bg_load_btn, self.vcam_bg_telemost_btn, self.vcam_bg_clear_btn,
-                  self.vcam_avatar_bg_lbl, self.vcam_avatar_bg_color_btn,
-                  self.vcam_cx_spin, self.vcam_cy_spin,
-                  self.vcam_cr_sld, self.vcam_cr_spin):
-            w.setEnabled(active)
+        mode = self.vcam_mode_combo.currentData()
+        circle = active and mode == "circle"
+        background = active and mode in ("background", "circle")
+        self.vcam_mode_combo.setEnabled(active)
+        self.vcam_scale_sld.setEnabled(active)
+        self.vcam_circle_overlay_chk.setEnabled(active and not circle)
+        self.vcam_vignette_size_sld.setEnabled(active and not circle and self.vcam_circle_overlay_chk.isChecked())
+        for widget in (self.vcam_builtin_combo, self.vcam_bg_load_btn, self.vcam_bg_path_lbl):
+            widget.setEnabled(background)
+        self.vcam_bg_clear_btn.setEnabled(background and self.vcam_builtin_combo.currentData() == "file")
+        for widget in (self.vcam_avatar_bg_lbl, self.vcam_avatar_bg_color_btn,
+                       self.vcam_cx_spin, self.vcam_cy_spin, self.vcam_cr_sld, self.vcam_cr_spin):
+            widget.setEnabled(circle)
+
+    def _set_vcam_circle_center(self, axis, value):
+        if self.owner is None:
+            return
+        setattr(self.owner.state, f"vcam_circle_{axis}", int(value))
+        if self.owner.chroma.persist:
+            self.owner.save_config()
 
     def _on_vcam_circle_r_changed(self, value: int):
         if self.owner is None:
@@ -3609,13 +3776,18 @@ class ChromaDialog(QDialog):
         mode = str(mode)
         if self.owner.state.vcam_mode == mode:
             return
-        was_enabled = bool(getattr(self.owner.state, "vcam_enabled", False))
         self.owner.state.vcam_mode = mode
-        if was_enabled:
-            self._restart_vcam_if_enabled()
+        self._update_vcam_native_dependents()
         if self.owner.chroma.persist:
             self.owner.save_config()
         self._update_vcam_status()
+
+    def _on_vcam_builtin_bg(self, index):
+        kind = self.vcam_builtin_combo.itemData(index)
+        if self.owner is None or kind not in ("gradient", "white"):
+            return
+        self.owner.state.vcam_builtin_bg = kind
+        self._on_vcam_clear_bg()
 
     def _on_vcam_load_bg(self):
         if self.owner is None:
@@ -3662,24 +3834,11 @@ class ChromaDialog(QDialog):
     def _on_vcam_telemost_bg(self):
         if self.owner is None:
             return
-        # Режим Телемост теперь собирается слоями:
-        # 1) нижняя подложка: белая, если файл не выбран;
-        # 2) та же виньетка, что в плавающем окне;
-        # 3) верхний фон аватарки с круглым вырезом.
-        self.owner.state.vcam_bg_path = ""
-        self.owner._bg_cache = {"path": "", "img": None}
-        self.owner.state.vcam_circle_x = 422
-        self.owner.state.vcam_circle_y = 240
-        self.owner.state.vcam_circle_r = 150
-        self.owner.state.vcam_mode = "circle"
-        self.owner.state.vcam_scale = 100
-        self.owner.state.vcam_vignette_scale = 100
-        self.owner.state.vcam_circle_overlay = True
-        self.owner.state.vcam_passthrough_native = False
-        self.owner.state.vcam_mirror = False
-        self.owner.state.vcam_avatar_bg_color = "#202128"
+        was_native = self.owner.state.vcam_passthrough_native
+        _apply_telemost_settings(self.owner)
         self._load_vcam_from_owner()
-        self._restart_vcam_if_enabled()
+        if was_native and self.owner.vcam_res_override and tuple(self.owner.vcam_res_override) != (self.owner.vcam_w, self.owner.vcam_h):
+            self._restart_vcam_if_enabled()
         if self.owner.chroma.persist:
             self.owner.save_config()
 
@@ -3817,8 +3976,14 @@ class ChromaDialog(QDialog):
         idx = self._pick_target
         self.chroma.picks[idx].color = [int(r), int(g), int(b)]
         self.chroma.picks[idx].pos = [int(x), int(y)]
+        if self.owner is not None:
+            getattr(self.owner, "_live_pick_colors", {}).pop(idx, None)
+            getattr(self.owner, "_live_pick_refs", {}).pop(idx, None)
+            self.owner._last_live_pick_time = 0.0
         self._refresh_slot_visual(idx)
         self._pick_target = None
+        if self.owner is not None and self.chroma.persist:
+            self.owner.save_config()
 
     def _apply_crop_from_drag(self):
         if self.owner is None:
@@ -4056,7 +4221,9 @@ class ChromaDialog(QDialog):
         if saved_w <= 0 or saved_h <= 0:
             owner.vcam_h, owner.vcam_w = src.shape[:2]
         try:
-            rgb = owner._compose_vcam_frame(src)
+            rgb = owner._last_vcam_rgb
+            if rgb is None:
+                rgb = owner._compose_vcam_frame(src)
         except Exception as e:
             _log_exc("integrated vcam preview", e)
             rgb = None
@@ -4067,64 +4234,16 @@ class ChromaDialog(QDialog):
             return
         self._put_rgb_to_label(rgb, self.vcam_preview_lbl)
 
-    def _apply_owner_crop(self, frame):
-        if self.owner is None:
-            return frame
-
-        # Важно: предпросмотр виньетки должен использовать тот же активный
-        # кроп, что и плавающее окно. Детектор здесь повторно не запускаем —
-        # берём последний runtime из основного QTimer/_on_tick.
-        if getattr(self.owner.dynamic_crop, "enabled", False):
-            runtime = getattr(self.owner, "_dynamic_crop_runtime", None)
-            rect = getattr(runtime, "crop_rect", None)
-            if rect and hasattr(self.owner, "_crop_rect_with_padding"):
-                crop = self.owner._crop_rect_with_padding(frame, rect)
-                if crop is not None:
-                    return crop
-            return frame
-
-        if not self.owner.crop.enabled or not self.owner.crop.rect:
-            return frame
-        x, y, w, h = self.owner.crop.rect
-        fh, fw = frame.shape[:2]
-        x = int(clamp(x, 0, fw - 1))
-        y = int(clamp(y, 0, fh - 1))
-        w = int(clamp(w, 1, fw - x))
-        h = int(clamp(h, 1, fh - y))
-        return frame[y:y + h, x:x + w].copy()
-
     def _compose_window_preview_rgb(self, frame):
         owner = self.owner
-        src = self._apply_owner_crop(frame)
-        disp = cv2.flip(src, 1) if owner.state.window_mirror else src
-        target = 360
-        h, w = disp.shape[:2]
-        scale = max(target / max(1, w), target / max(1, h))
-        nw, nh = max(1, int(ceil(w * scale))), max(1, int(ceil(h * scale)))
-        rs = cv2.resize(disp, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        sx = max(0, (rs.shape[1] - target) // 2)
-        sy = max(0, (rs.shape[0] - target) // 2)
-        roi = rs[sy:sy + target, sx:sx + target].copy()
-        if roi.shape[0] != target or roi.shape[1] != target:
-            pad = np.zeros((target, target, 3), dtype=roi.dtype)
-            pad[:roi.shape[0], :roi.shape[1]] = roi
-            roi = pad
-
-        circle_size = min(roi.shape[:2])
-        if owner.state.window_shape == "circle":
-            content_scale = clamp(getattr(owner.state, "window_content_scale", 100) / 100.0, 0.70, 1.00)
-            circle_size = max(1, int(round(circle_size * content_scale)))
-            if circle_size < min(roi.shape[:2]):
-                roi = owner._shrink_into_canvas(roi, target, target, scale=content_scale)
-
-        alpha = owner._build_alpha(roi) if owner.chroma.enabled else np.full((roi.shape[0], roi.shape[1]), 255, dtype=np.uint8)
-        if owner.state.window_shape == "circle":
-            cm = owner._circle_mask(circle_size)
-            sm = np.zeros((roi.shape[0], roi.shape[1]), dtype=np.uint8)
-            oy = (roi.shape[0] - circle_size) // 2
-            ox = (roi.shape[1] - circle_size) // 2
-            sm[oy:oy + circle_size, ox:ox + circle_size] = cm
-            alpha = (alpha.astype(np.uint16) * sm // 255).astype(np.uint8)
+        layer = owner._last_window_layer
+        if layer is None:
+            roi, alpha = owner._compose_window_vignette_bgra(
+                frame, 360, mirror=bool(owner.state.window_mirror))
+        else:
+            roi, alpha = layer
+            roi = cv2.resize(roi, (360, 360), interpolation=cv2.INTER_AREA)
+            alpha = cv2.resize(alpha, (360, 360), interpolation=cv2.INTER_AREA)
 
         bg = np.full_like(roi, 15)
         a3 = (alpha.astype(np.float32) / 255.0)[..., None]
@@ -4287,6 +4406,22 @@ class HotkeysDialog(QDialog):
 # ---------------------------------------------------------------------------
 # Диалог настроек виртуальной камеры
 # ---------------------------------------------------------------------------
+def _apply_telemost_settings(owner):
+    state = owner.state
+    state.vcam_bg_path = ""
+    owner._bg_cache = {"path": "", "img": None}
+    state.vcam_circle_x = 427
+    state.vcam_circle_y = 241
+    state.vcam_circle_r = 147
+    state.vcam_mode = "circle"
+    state.vcam_scale = 128
+    state.vcam_vignette_scale = 100
+    state.vcam_circle_overlay = True
+    state.vcam_passthrough_native = False
+    state.vcam_mirror = False
+    state.vcam_avatar_bg_color = "#242429"
+
+
 class VCamSettingsDialog(QDialog):
     """Диалог настроек виртуальной камеры (v17).
 
@@ -4734,30 +4869,12 @@ class VCamSettingsDialog(QDialog):
 
     def _on_telemost_bg(self):
         """Подставляет встроенный фон «Для Телемоста»."""
-        try:
-            path = self._ensure_telemost_bg_png()
-        except Exception as e:
-            QMessageBox.warning(self, "Фон Телемоста", str(e))
-            return
-
-        self.owner.state.vcam_bg_path = os.path.abspath(path)
-        self.owner._bg_cache = {"path": "", "img": None}
-
-        self.owner.state.vcam_circle_x = 422
-        self.owner.state.vcam_circle_y = 240
-        self.owner.state.vcam_circle_r = 150
-        self.owner.state.vcam_mode = "circle"
-        self.owner.state.vcam_scale = 78
-        self.owner.state.vcam_vignette_scale = 50
-        self.owner.state.vcam_circle_overlay = True
-        self.owner.state.vcam_passthrough_native = False
-        self.owner.state.vcam_mirror = False
-
+        _apply_telemost_settings(self.owner)
         self._update_bg_label()
         self.cx_spin.setRange(0, 855)
         self.cy_spin.setRange(0, 511)
         self.cr_spin.setRange(1, min(855, 511) // 2)
-        for sp, val in ((self.cx_spin, 422), (self.cy_spin, 240), (self.cr_spin, 150)):
+        for sp, val in ((self.cx_spin, 427), (self.cy_spin, 241), (self.cr_spin, 147)):
             sp.blockSignals(True)
             sp.setValue(val)
             sp.blockSignals(False)
@@ -4772,8 +4889,8 @@ class VCamSettingsDialog(QDialog):
             w.blockSignals(True)
             w.setChecked(val)
             w.blockSignals(False)
-        for sld, val in ((self.scale_sld, 78),
-                         (self.vignette_size_sld, 50)):
+        for sld, val in ((self.scale_sld, self.owner.state.vcam_scale),
+                         (self.vignette_size_sld, 100)):
             sld.blockSignals(True)
             sld.setValue(val)
             sld.blockSignals(False)
@@ -4845,7 +4962,9 @@ class VCamSettingsDialog(QDialog):
         if saved_w <= 0 or saved_h <= 0:
             owner.vcam_h, owner.vcam_w = frame.shape[:2]
         try:
-            rgb = owner._compose_vcam_frame(frame)
+            rgb = owner._last_vcam_rgb
+            if rgb is None:
+                rgb = owner._compose_vcam_frame(frame)
         except Exception as e:
             _log_exc("vcam preview", e)
             rgb = None
@@ -5034,8 +5153,15 @@ class RoundCamWindow(QWidget):
         self._pending_frame_bgr = None
         self._pending_frame_id = 0
         self._processed_frame_id = 0
+        self._last_vcam_rgb = None
+        self._last_window_layer = None
+        self._vignette_confidence = (None, None, None)
+        self._telemost_layers = None
         self.camera_index     = 0 if args.camera is None else int(args.camera)
         self.last_frame_bgr   = None
+        self._live_pick_colors = {}
+        self._live_pick_refs = {}
+        self._last_live_pick_time = 0.0
         self._no_frame_count  = 0
         self._circle_mask_cache: dict = {}
         # Кэш фоновой картинки и параметров круга
@@ -5126,8 +5252,14 @@ class RoundCamWindow(QWidget):
     def _open_camera(self, index: int) -> bool:
         if getattr(self, "_shutdown_started", False):
             return False
+        self._live_pick_colors.clear()
+        self._live_pick_refs.clear()
+        self._last_live_pick_time = 0.0
         backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
         self._stop_capture_loop(release=True, log=False)
+        if self._capture_loop.is_running():
+            _logger.error("Предыдущий поток захвата камеры ещё не остановился")
+            return False
         cap = cv2.VideoCapture(index, backend)
         if not cap.isOpened():
             try:
@@ -5144,6 +5276,9 @@ class RoundCamWindow(QWidget):
         except Exception as e:
             _log_exc("Ошибка настройки камеры", e)
         self.cap = cap
+        self._last_vcam_rgb = None
+        self._last_window_layer = None
+        self._vignette_confidence = (None, None, None)
         self._pending_frame_bgr = None
         self._pending_frame_id = 0
         self._processed_frame_id = 0
@@ -5182,6 +5317,7 @@ class RoundCamWindow(QWidget):
         """Создаёт подменю. Стиль наследуется от родителя автоматически
         (благодаря глобальному QApplication.setStyleSheet(STYLE_QSS))."""
         m = QMenu(title, self)
+        m.setToolTipsVisible(True)
         parent.addMenu(m)
         return m
 
@@ -5204,14 +5340,16 @@ class RoundCamWindow(QWidget):
         self.act_on_top      = QAction("Всегда поверх",        self, checkable=True)
         self.act_mirror      = QAction("Отразить зеркально",   self, checkable=True)
         self.act_click_thru  = QAction("Прокликиваемый",       self, checkable=True)
-        self.act_vcam_enable = QAction("Вкл/выкл",             self, checkable=True)
+        self.act_vcam_enable = QAction("Включить виртуальную камеру",             self, checkable=True)
         self.act_vcam_mirror = QAction("Отразить зеркально",   self, checkable=True)
-        self.act_vcam_fill   = QAction("По ширине окна",        self, checkable=True)
         self.act_chroma      = QAction("Хромакей: вкл/выкл",   self, checkable=True)
         self.act_chroma_cfg  = QAction("Свойства…",             self)
+        self.act_composition_head = QAction("Только голова", self)
+        self.act_composition_shoulders = QAction("Голова и плечи", self)
+        self.act_composition_torso = QAction("Голова и часть торса", self)
         self.act_chroma_settings = QAction("Настройки хромакея / виньетки…", self)
-        self.act_crop_off    = QAction("Выключен",             self, checkable=True)
-        self.act_crop_manual = QAction("Включен",              self, checkable=True)
+        self.act_crop_off    = QAction("Без кропа",             self, checkable=True)
+        self.act_crop_manual = QAction("Ручной кроп",              self, checkable=True)
         self.act_dynamic_crop = QAction("Динамический",         self, checkable=True)
         self.act_dynamic_crop.setToolTip("Автокомпозиция лица для плавающего окна. Ручной кроп не изменяет.")
         self.act_dynamic_auto_zoom = QAction("Автозум", self, checkable=True)
@@ -5249,7 +5387,7 @@ class RoundCamWindow(QWidget):
         self.act_size_down   = QAction("Уменьшить окно",        self)
         self.act_ptz_settings = QAction("Настройки PTZ…",       self)
         self.act_about       = QAction("О программе…",         self)
-        self.act_hotkeys     = QAction("Hotkeys…",             self)
+        self.act_hotkeys     = QAction("Горячие клавиши…",             self)
         self.act_exit        = QAction("Выход",                 self)
         # Сброс
         self.act_reset_pos   = QAction("Позиция и размер окна", self)
@@ -5313,13 +5451,14 @@ class RoundCamWindow(QWidget):
         self.act_click_thru.toggled.connect(self.set_click_through)
         self.act_vcam_enable.toggled.connect(self.set_vcam_enabled)
         self.act_vcam_mirror.toggled.connect(self.set_vcam_mirror)
-        self.act_vcam_fill.toggled.connect(
-            lambda v: setattr(self.state, "vcam_fit", "fill" if v else "letterbox"))
         self.act_chroma.toggled.connect(self.set_chroma_enabled)
         # Пункт «Хромакей…» в меню теперь сразу открывает диалог,
         # а не подменю «Вкл/выкл / Настройки». act_chroma_cfg всё
         # равно нужен — у него хоткей Ctrl+K.
-        self.act_chroma_cfg.triggered.connect(self._open_chroma_dialog)
+        self.act_chroma_cfg.triggered.connect(lambda: self._open_chroma_dialog())
+        self.act_composition_head.triggered.connect(lambda checked=False: self._apply_composition_preset("head"))
+        self.act_composition_shoulders.triggered.connect(lambda checked=False: self._apply_composition_preset("shoulders"))
+        self.act_composition_torso.triggered.connect(lambda checked=False: self._apply_composition_preset("torso"))
         self.act_chroma_settings.triggered.connect(self._open_chroma_settings)
         self.act_size_up.triggered.connect(lambda checked=False: self._scale_circle(1))
         self.act_size_down.triggered.connect(lambda checked=False: self._scale_circle(-1))
@@ -5370,7 +5509,6 @@ class RoundCamWindow(QWidget):
         self.set_crop_mode(self._current_crop_mode(), save=False)
         self._sync_ptz_menu_actions()
         self._set_window_shape(self.state.window_shape)
-        self.act_vcam_fill.setChecked(self.state.vcam_fit == "fill")
         self._update_cam_label()
 
     def _spin_action(self, parent_menu: QMenu, label: str, widget: QWidget) -> QWidgetAction:
@@ -5567,6 +5705,7 @@ class RoundCamWindow(QWidget):
         """
         # Камера — верхний быстрый пункт, как в старой версии.
         menu.addAction(self.act_cam_toggle)
+        menu.addAction(self.act_chroma_cfg)
 
         # === Окно ===
         win_m = self._sub(menu, "Окно")
@@ -5605,6 +5744,10 @@ class RoundCamWindow(QWidget):
         crop_m.addAction(self.act_crop_off)
         crop_m.addAction(self.act_crop_manual)
         crop_m.addAction(self.act_dynamic_crop)
+        crop_m.addSeparator()
+        crop_m.addAction(self.act_composition_head)
+        crop_m.addAction(self.act_composition_shoulders)
+        crop_m.addAction(self.act_composition_torso)
         crop_m.addSeparator()
         crop_m.addAction(self.act_dynamic_auto_zoom)
         crop_m.addAction(self.act_dynamic_lock_zoom)
@@ -5646,7 +5789,6 @@ class RoundCamWindow(QWidget):
 
         # === Настройки и сброс ===
         menu.addSeparator()
-        menu.addAction(self.act_chroma_cfg)
 
         reset_m = self._sub(menu, "Сброс")
         reset_m.addAction(self.act_reset_pos)
@@ -5874,8 +6016,15 @@ class RoundCamWindow(QWidget):
             self.save_config()
 
     def set_vcam_mirror(self, v: bool):
+        changed = self.state.vcam_mirror != bool(v)
         self.state.vcam_mirror = bool(v)
         self._set_action_checked(self.act_vcam_mirror, self.state.vcam_mirror)
+        dlg = getattr(self, "_chroma_dlg", None)
+        if dlg is not None:
+            with QtCore.QSignalBlocker(dlg.vcam_mirror_chk):
+                dlg.vcam_mirror_chk.setChecked(self.state.vcam_mirror)
+        if changed and self.chroma.persist:
+            self.save_config()
 
     def set_chroma_enabled(self, v: bool):
         self.chroma.enabled = bool(v)
@@ -6024,6 +6173,10 @@ class RoundCamWindow(QWidget):
             self.save_config()
 
     def set_ptz_auto_enabled(self, value: bool):
+        if self.ptz.enabled != bool(value):
+            self._ptz_runtime.auto_intent.clear()
+            self._ptz_runtime.auto_settle_until = 0.0
+            self._ptz_runtime.cooldown = 0
         self.ptz.enabled = bool(value)
         self._sync_ptz_menu_actions()
         dlg = getattr(self, "_chroma_dlg", None)
@@ -6079,6 +6232,77 @@ class RoundCamWindow(QWidget):
     def set_crop_enabled(self, v: bool):
         # Совместимость со старыми QAction/хоткеями.
         self.set_crop_mode("manual" if v else "off")
+
+    def _save_composition_preset(self, preset: str):
+        """Сохраняет текущий режим, рамку и все параметры динамического кропа."""
+        cfg = self.dynamic_crop
+        presets = _normalize_composition_presets(getattr(cfg, "composition_presets", None))
+        if preset not in presets:
+            return
+        dynamic = asdict(cfg)
+        dynamic.pop("composition_presets", None)
+        presets[preset] = {
+            "circle_to_head": float(cfg.circle_to_head),
+            "offset_y": float(cfg.offset_y),
+            "mode": self._current_crop_mode(),
+            "crop": asdict(self.crop),
+            "dynamic_crop": dynamic,
+        }
+        cfg.composition_presets = presets
+        if self.chroma.persist:
+            self.save_config()
+
+    def _apply_composition_preset(self, preset: str):
+        """Восстанавливает сохранённый кроп или прежний стартовый пресет."""
+        presets = _normalize_composition_presets(getattr(self.dynamic_crop, "composition_presets", None))
+        if preset not in presets:
+            return
+        cfg = self.dynamic_crop
+        cfg.composition_presets = presets
+        saved = presets[preset]
+        if "dynamic_crop" in saved:
+            for name, current in asdict(cfg).items():
+                if name in ("composition_presets", "enabled") or name not in saved["dynamic_crop"]:
+                    continue
+                value = saved["dynamic_crop"][name]
+                if (isinstance(current, bool) and isinstance(value, bool) or
+                    isinstance(current, (int, float)) and not isinstance(current, bool) and isinstance(value, (int, float)) and not isinstance(value, bool) or
+                    isinstance(current, str) and isinstance(value, str) or
+                    current is None and (value is None or isinstance(value, (int, float)))):
+                    setattr(cfg, name, value)
+            self.crop.rect = _safe_rect(saved["crop"].get("rect"), self.crop.rect)
+            normalize = getattr(self, "_normalize_loaded_config", None)
+            if callable(normalize):
+                normalize()
+            self.set_crop_mode(saved["mode"], save=False)
+        else:
+            cfg.circle_to_head = saved["circle_to_head"]
+            old_defaults = {"head": (1.80, 0.08), "shoulders": (2.80, -0.10), "torso": (3.70, -0.18)}
+            old_size, old_offset = old_defaults[preset]
+            was_default = abs(saved["circle_to_head"] - old_size) < 1e-6 and abs(saved["offset_y"] - old_offset) < 1e-6
+            cfg.offset_y = 0.0 if was_default else saved["offset_y"]
+            cfg.offset_x = cfg.circle_offset_x = cfg.circle_offset_y = 0.0
+            cfg.crop_padding = 1.05
+            cfg.auto_zoom_enabled = True
+            cfg.zoom_mode = "auto"
+            cfg.auto_zoom_max_ratio = 2.0
+            self.set_crop_mode("dynamic", save=False)
+        if bool(getattr(cfg, "enabled", False)):
+            cfg.auto_composition = True
+            cfg.composition_profile = preset
+        self._dynamic_crop_runtime = DynamicCropRuntimeState()
+        self._reset_face_director()
+        self._sync_dynamic_menu_actions()
+        dlg = getattr(self, "_chroma_dlg", None)
+        if dlg is not None:
+            try:
+                dlg._load_dynamic_from_owner()
+                dlg._update_crop_label()
+            except (RuntimeError, AttributeError):
+                self._chroma_dlg = None
+        self.update()
+        if self.chroma.persist:
+            self.save_config()
 
     def set_dynamic_crop_enabled(self, v: bool, save: bool = True):
         """Совместимость со старым API: теперь это режим кропа."""
@@ -6337,6 +6561,8 @@ class RoundCamWindow(QWidget):
                 else:
                     # Кадра ещё нет — возьмём разумный дефолт
                     self.vcam_w, self.vcam_h = 1280, 720
+            else:
+                self.vcam_w, self.vcam_h = self.vcam_res_override
             try:
                 self.vcam = pyvirtualcam.Camera(
                     width=self.vcam_w, height=self.vcam_h,
@@ -6345,12 +6571,13 @@ class RoundCamWindow(QWidget):
                              self.vcam_w, self.vcam_h, self.fps or 30)
             except Exception as e:
                 _log_exc("Ошибка запуска виртуальной камеры", e)
-                QMessageBox.critical(self, "Ошибка", f"Виртуальная камера:\n{e}")
                 self.vcam = None
                 self.state.vcam_enabled = False
                 self._set_action_checked(self.act_vcam_enable, False)
+                QMessageBox.critical(self, "Ошибка", f"Виртуальная камера:\n{e}")
 
     def _stop_vcam(self):
+        self._last_vcam_rgb = None
         if self.vcam is not None:
             cam = self.vcam
             self.vcam = None
@@ -6401,7 +6628,11 @@ class RoundCamWindow(QWidget):
         elif axis == "zoom" and bool(getattr(cfg, "invert_zoom", False)):
             direction = -direction
 
+        automatic = reason.startswith("auto")
         step = float(self._ptz_step_value(axis))
+        if automatic:
+            # Keep manual steps intact and give the camera time to settle.
+            step = min(step, 3.0 if axis == "pan" else 2.0)
 
         command_attr = f"command_{axis}"
         stored_command = getattr(self._ptz_runtime, command_attr, None)
@@ -6424,7 +6655,9 @@ class RoundCamWindow(QWidget):
         # а не от cap.get(). У многих DirectShow-драйверов cap.get() врёт: всегда
         # возвращает 0 или старое значение. Тогда v9 каждый раз слал один и тот же
         # target и камера визуально не двигалась. Великолепная API-ловушка, куда же без неё.
-        if stored_command is not None and np.isfinite(float(stored_command)):
+        if automatic and current is not None:
+            base = current
+        elif stored_command is not None and np.isfinite(float(stored_command)):
             base = float(stored_command)
         elif current is not None:
             base = float(current)
@@ -6432,6 +6665,10 @@ class RoundCamWindow(QWidget):
             base = 0.0
 
         target = base + float(direction) * step
+        if automatic:
+            target = clamp(target, getattr(cfg, f"{axis}_min"), getattr(cfg, f"{axis}_max"))
+            if target == base:
+                return False
         try:
             lock = getattr(self, "_cap_lock", threading.RLock())
             if not lock.acquire(timeout=0.25):
@@ -6608,102 +6845,66 @@ class RoundCamWindow(QWidget):
             self.save_config()
 
     def _ptz_process_dynamic_tracking(self, frame: np.ndarray, runtime: DynamicCropRuntimeState):
-        cfg = getattr(self, "ptz", PTZConfig())
-        if not bool(getattr(cfg, "enabled", False)):
+        cfg = self.ptz
+        state = self._ptz_runtime
+        if not cfg.enabled or frame is None or runtime is None:
             return
-        if frame is None or runtime is None:
-            return
-
-        if self._ptz_runtime.cooldown > 0:
-            self._ptz_runtime.cooldown -= 1
-            return
-
-        h, w = frame.shape[:2]
-        if h <= 1 or w <= 1:
+        face = runtime.raw_face or runtime.face
+        circle = runtime.circle
+        if not runtime.face_found or face is None:
+            state.auto_intent.clear()
+            state.last_trigger = ""
             return
 
-        pan_dir = 0
-        tilt_dir = 0
-        reasons = []
+        now = time.monotonic()
+        if state.cooldown > 0:
+            state.cooldown -= 1
+        height, width = frame.shape[:2]
+        if min(height, width) <= 1:
+            return
+        directions = {}
+        if cfg.trigger_edge_guard and circle is not None:
+            # The crop padding can touch both borders even with a centered face.
+            # Use the visible circle and require the face to be on the same side.
+            margin = clamp(cfg.edge_guard_percent / 100.0, 0.0, 0.30)
+            radius = circle.diameter / 2.0
+            for axis, center, face_center, length in (
+                ("pan", circle.cx, face.cx, width),
+                ("tilt", circle.cy, face.cy, height),
+            ):
+                if face_center < length * 0.38 and center - radius <= length * margin:
+                    directions[axis] = (-1, "край круга")
+                elif face_center > length * 0.62 and center + radius >= length * (1.0 - margin):
+                    directions[axis] = (1, "край круга")
 
-        rect = runtime.crop_rect
-        face = runtime.face
+        if cfg.trigger_focus_vertical_thirds:
+            third = clamp(cfg.focus_third_percent / 100.0, 0.20, 0.38)
+            if face.cy <= height * third:
+                directions["tilt"] = (-1, "лицо в верхней зоне")
+            elif face.cy >= height * (1.0 - third):
+                directions["tilt"] = (1, "лицо в нижней зоне")
 
-        # Триггер 1: динамический кроп упёрся в запас края исходного изображения.
-        # Это главный сигнал: программному кропу уже некуда брать сцену, пора
-        # двигать физическую камеру.
-        if bool(getattr(cfg, "trigger_edge_guard", True)) and rect:
-            margin_ratio = clamp(float(getattr(cfg, "edge_guard_percent", 10)) / 100.0, 0.0, 0.30)
-            margin_x = float(w) * margin_ratio
-            margin_y = float(h) * margin_ratio
-            x, y, rw, rh = [float(v) for v in rect]
-
-            touches_left = x <= margin_x
-            touches_right = x + rw >= float(w) - margin_x
-            touches_top = y <= margin_y
-            touches_bottom = y + rh >= float(h) - margin_y
-
-            if touches_left and touches_right and face is not None:
-                # Кроп шире безопасной зоны: выбираем направление по положению лица.
-                if face.cx < w * 0.47:
-                    pan_dir = -1; reasons.append("edge wide left")
-                elif face.cx > w * 0.53:
-                    pan_dir = 1; reasons.append("edge wide right")
-            elif touches_left:
-                pan_dir = -1; reasons.append("left edge")
-            elif touches_right:
-                pan_dir = 1; reasons.append("right edge")
-
-            if touches_top and touches_bottom and face is not None:
-                if face.cy < h * 0.47:
-                    tilt_dir = -1; reasons.append("edge wide top")
-                elif face.cy > h * 0.53:
-                    tilt_dir = 1; reasons.append("edge wide bottom")
-            elif touches_top:
-                tilt_dir = -1; reasons.append("top edge")
-            elif touches_bottom:
-                tilt_dir = 1; reasons.append("bottom edge")
-
-        # Триггер 2: фокусная точка лица ушла в верхнюю/нижнюю треть кадра.
-        # Используем фактический центр лица, а не центр crop-а: crop может держать
-        # красивую картинку программно, но физическая камера всё ещё смотрит не туда.
-        if bool(getattr(cfg, "trigger_focus_vertical_thirds", True)) and face is not None:
-            third = clamp(float(getattr(cfg, "focus_third_percent", 33)) / 100.0, 0.20, 0.45)
-            fy = float(face.cy)
-            if fy <= h * third:
-                tilt_dir = -1; reasons.append("focus top third")
-            elif fy >= h * (1.0 - third):
-                tilt_dir = 1; reasons.append("focus bottom third")
-
-        if not reasons:
-            self._ptz_runtime.last_trigger = ""
+        state.last_trigger = ", ".join(f"{axis}: {reason}" for axis, (_, reason) in directions.items())
+        if now < state.auto_settle_until or state.cooldown:
             return
 
-        reason_text = ", ".join(reasons)
-        self._ptz_runtime.last_trigger = reason_text
-
-        attempted = False
-        issued = False
-        # За один тик даём максимум две команды: pan и tilt. Очереди не плодим.
-        if pan_dir < 0:
-            attempted = True
-            issued = self._ptz_pan(-1, reason=reason_text) or issued
-        elif pan_dir > 0:
-            attempted = True
-            issued = self._ptz_pan(1, reason=reason_text) or issued
-        if tilt_dir < 0:
-            attempted = True
-            issued = self._ptz_tilt(-1, reason=reason_text) or issued
-        elif tilt_dir > 0:
-            attempted = True
-            issued = self._ptz_tilt(1, reason=reason_text) or issued
-
-        # Cooldown ставим даже при отказе драйвера, иначе будем долбить CAP_PROP
-        # каждый кадр и тормозить весь видеоконтур. Спасибо, Windows, очень мило.
-        if attempted:
-            self._ptz_runtime.cooldown = int(clamp(getattr(cfg, "cooldown_frames", 8), 1, 60))
-            if not issued and not getattr(self._ptz_runtime, "last_error", ""):
-                self._ptz_runtime.last_error = f"PTZ-триггер есть, команда не выполнена: {reason_text}"
+        for axis in ("pan", "tilt"):
+            if axis not in directions:
+                state.auto_intent.pop(axis, None)
+                continue
+            direction, reason = directions[axis]
+            previous = state.auto_intent.get(axis)
+            if previous is None or previous[0] != direction:
+                state.auto_intent[axis] = (direction, now)
+                continue
+            # Wait for the Insta360's own tracking to bring the face back.
+            if now - previous[1] < 0.85:
+                continue
+            self._ptz_adjust(axis, direction, reason=f"auto: {reason}")
+            state.auto_intent.clear()
+            state.auto_settle_until = now + 1.10
+            state.cooldown = int(clamp(cfg.cooldown_frames, 1, 60))
+            break
 
     # ------------------------------------------------------------------
     # Модуль автокомпозиции лица
@@ -6738,6 +6939,8 @@ class RoundCamWindow(QWidget):
             offset_y=float(getattr(cfg, "offset_y", -0.05)),
             circle_offset_x=float(getattr(cfg, "circle_offset_x", 0.0)),
             circle_offset_y=float(getattr(cfg, "circle_offset_y", 0.0)),
+            auto_composition=bool(getattr(cfg, "auto_composition", False)),
+            composition_profile=str(getattr(cfg, "composition_profile", "shoulders")),
             return_speed=float(getattr(cfg, "return_speed", DEFAULT_DYNAMIC_RETURN_SPEED)),
             show_debug_view=bool(getattr(cfg, "show_debug_view", False)),
             fast_roi_tracking=bool(getattr(cfg, "fast_roi_tracking", True)),
@@ -7459,6 +7662,7 @@ class RoundCamWindow(QWidget):
                 self._no_frame_count = 0
 
             self.last_frame_bgr = frame
+            self._update_dynamic_pick_colors(frame)
             src = frame
 
             # Кроп для плавающего окна.
@@ -7494,8 +7698,8 @@ class RoundCamWindow(QWidget):
             roi, roi_source_alpha = self._fit_square_with_optional_alpha(
                 src, target, alpha=src_alpha, mirror=bool(self.state.window_mirror))
 
-            # Альфа-маска
-            alpha = self._build_alpha(roi) if self.chroma.enabled else \
+            confidence = self._shared_vignette_confidence(frame, src, target, self.state.window_mirror)
+            alpha = self._build_alpha(roi, confidence) if self.chroma.enabled else \
                     np.full((roi.shape[0], roi.shape[1]), 255, dtype=np.uint8)
             if roi_source_alpha is not None:
                 alpha = (alpha.astype(np.uint16) * roi_source_alpha.astype(np.uint16) // 255).astype(np.uint8)
@@ -7503,13 +7707,10 @@ class RoundCamWindow(QWidget):
             if self.state.window_shape == "circle":
                 size, should_shrink = self._window_visible_circle_size(roi)
                 if should_shrink and size < min(roi.shape[:2]):
+                    scale = size / max(1, min(roi.shape[:2]))
                     roi = self._shrink_into_canvas(roi, target, target,
-                                                   scale=size / max(1, min(roi.shape[:2])))
-                    if roi_source_alpha is not None:
-                        roi_source_alpha = self._shrink_into_canvas(roi_source_alpha, target, target,
-                                                                    scale=size / max(1, min(roi.shape[:2])),
-                                                                    fill_value=0)
-                        alpha = (alpha.astype(np.uint16) * roi_source_alpha.astype(np.uint16) // 255).astype(np.uint8)
+                                                   scale=scale)
+                    alpha = self._shrink_into_canvas(alpha, target, target, scale=scale, fill_value=0)
                 cm   = self._circle_mask(size)
                 sm   = np.zeros((roi.shape[0], roi.shape[1]), dtype=np.uint8)
                 oy = (roi.shape[0] - size) // 2
@@ -7517,6 +7718,7 @@ class RoundCamWindow(QWidget):
                 sm[oy:oy+size, ox:ox+size] = cm
                 alpha = (alpha.astype(np.uint16) * sm // 255).astype(np.uint8)
 
+            self._last_window_layer = roi, alpha
             rgb  = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
             argb = np.dstack((rgb, alpha))
             qimg = QImage(argb.data, argb.shape[1], argb.shape[0], QImage.Format_RGBA8888)
@@ -7531,6 +7733,7 @@ class RoundCamWindow(QWidget):
                 if out is not None:
                     try:
                         self.vcam.send(out)
+                        self._last_vcam_rgb = out
                         # В QTimer темп уже задаёт Qt. sleep_until_next_frame()
                         # блокирует GUI-поток и превращает живое окно в слайдшоу.
                     except Exception as e:
@@ -7539,13 +7742,82 @@ class RoundCamWindow(QWidget):
         except Exception as e:
             _log_exc("on_tick", e)
 
-    def _build_alpha(self, bgr) -> np.ndarray:
+    def _update_dynamic_pick_colors(self, frame):
+        """Периодически обновляет пробы в координатах исходной камеры."""
+        now = time.monotonic()
+        if now - self._last_live_pick_time < 0.5:
+            return
+        self._last_live_pick_time = now
+        active = []
+        for index, slot in enumerate(self.chroma.picks):
+            if not slot.enabled or slot.color is None or slot.pos is None:
+                self._live_pick_colors.pop(index, None)
+                self._live_pick_refs.pop(index, None)
+                continue
+            ref = (tuple(slot.pos), tuple(slot.color))
+            if self._live_pick_refs.get(index) != ref:
+                self._live_pick_colors.pop(index, None)
+                self._live_pick_refs[index] = ref
+            active.append((index, slot))
+        if not active or not self.chroma.enabled:
+            return
+        try:
+            segmenter = self._ensure_hybrid_segmenter()
+            if segmenter is None:
+                return
+            from kgz_hybrid_chroma import sample_dynamic_pick
+            confidence = segmenter.confidence(frame)
+            for index, slot in active:
+                color = sample_dynamic_pick(frame, slot.pos, self._live_pick_colors.get(index), confidence)
+                if color is not None:
+                    self._live_pick_colors[index] = color
+            dlg = getattr(self, "_chroma_dlg", None)
+            if dlg is not None and dlg.isVisible():
+                for index, _slot in active:
+                    dlg._refresh_slot_visual(index)
+        except Exception as e:
+            _log_exc("Не удалось обновить динамические пипетки", e)
+
+    def _ensure_hybrid_segmenter(self):
+        segmenter = getattr(self, "_hybrid_segmenter", None)
+        if segmenter is not None:
+            return segmenter
+        try:
+            from kgz_hybrid_chroma import HybridSegmenter
+            segmenter = HybridSegmenter(_bundled_asset("selfie_segmenter.tflite"))
+            self._hybrid_segmenter = segmenter
+            return segmenter
+        except Exception as e:
+            _log_exc("Гибридный хромакей: не удалось загрузить модель", e)
+            return None
+
+    def _hybrid_confidence(self, frame):
+        segmenter = self._ensure_hybrid_segmenter()
+        try:
+            if segmenter is None:
+                raise RuntimeError("Модель сегментации недоступна")
+            return segmenter.confidence(frame)
+        except Exception as e:
+            _log_exc("Гибридный хромакей выключен", e)
+            self.chroma.hybrid_enabled = False
+            dlg = getattr(self, "_chroma_dlg", None)
+            if dlg is not None:
+                try:
+                    dlg.hybrid_chk.blockSignals(True)
+                    dlg.hybrid_chk.setChecked(False)
+                    dlg.hybrid_chk.blockSignals(False)
+                except RuntimeError:
+                    pass
+            tray = getattr(self, "tray", None)
+            if tray is not None:
+                tray.showMessage("КругоЗор", "Гибридный хромакей недоступен. Включён обычный режим.")
+            return None
+
+    def _build_alpha(self, bgr, confidence=None) -> np.ndarray:
         """Строит альфа-маску хромакея.
 
-        Механика возвращена к v12:
-          • если включён HSV — работает только HSV-диапазон;
-          • если HSV выключен — работают только включённые пипетки;
-          • пипетки и HSV не складываются через ИЛИ.
+        HSV и безопасно обновлённые пробы пипеток объединяются.
+        Без HSV используются текущие пробы либо сохранённые цвета.
 
         Интерфейс 13-5 сохранён: 4 пипетки, h_wrap, отдельная мягкость
         кеинга, мягкость виньетки и масштаб основного окна.
@@ -7575,23 +7847,44 @@ class RoundCamWindow(QWidget):
                 mask = cv2.inRange(hsv, lo, hi)
         else:
             mask = np.zeros(bgr.shape[:2], dtype=np.uint8)
-            bgr_f = None
-            for slot in self.chroma.picks:
-                if not slot.enabled or slot.color is None:
-                    continue
-                if bgr_f is None:
-                    bgr_f = bgr.astype(np.float32)
-                r, g, b = slot.color
-                diff = bgr_f - np.array([b, g, r], dtype=np.float32)
-                dist = np.sqrt((diff ** 2).sum(axis=2))
-                mask = np.maximum(mask, (dist <= float(slot.tol)).astype(np.uint8) * 255)
 
+        # Координаты пипеток относятся к исходной камере. Их текущие цвета
+        # обновляются до кропа, а здесь используются для любого представления.
+        live_colors = getattr(self, "_live_pick_colors", {})
+        bgr_f = None
+        for index, slot in enumerate(self.chroma.picks):
+            if not slot.enabled or slot.color is None:
+                continue
+            # При HSV добавляем только проверенные динамические пробы: до
+            # первой безопасной пробы старое поведение HSV не меняется.
+            if self.chroma.use_hsv and index not in live_colors:
+                continue
+            if bgr_f is None:
+                bgr_f = bgr.astype(np.float32)
+            r, g, b = live_colors.get(index, slot.color)
+            diff = bgr_f - np.array([b, g, r], dtype=np.float32)
+            dist = np.sqrt((diff ** 2).sum(axis=2))
+            mask = np.maximum(mask, (dist <= float(slot.tol)).astype(np.uint8) * 255)
+
+        background_coverage = cv2.blur(mask, (3, 3))
         k = int(self.chroma.feather)
         if k > 0:
             k = k if k % 2 else k + 1
             mask = cv2.GaussianBlur(mask, (k, k), 0)
 
-        return cv2.subtract(np.full_like(mask, 255), mask)
+        alpha = cv2.subtract(np.full_like(mask, 255), mask)
+        limit = cv2.bitwise_not(background_coverage)
+        if bool(getattr(self.chroma, "hybrid_enabled", False)):
+            if confidence is None:
+                confidence = self._hybrid_confidence(bgr)
+            if confidence is not None:
+                from kgz_hybrid_chroma import combine_hybrid_alpha, soften_person_confidence
+                # Keep high-confidence details even if clothing matches a key color.
+                protected = np.clip((confidence - 0.85) / 0.15, 0, 1)
+                limit = cv2.max(limit, cv2.convertScaleAbs(protected, alpha=255))
+                confidence = soften_person_confidence(confidence, self.chroma.feather)
+                alpha = combine_hybrid_alpha(alpha, confidence)
+        return cv2.min(alpha, limit)
 
     def _circle_mask(self, size: int) -> np.ndarray:
         """Круглая маска виньетки, мягкий край построен аналитически
@@ -7630,11 +7923,9 @@ class RoundCamWindow(QWidget):
                 # Ширина перехода: при f=100 — половина радиуса.
                 # Минимум 2 пикселя, чтобы не было видимых ступенек.
                 fw = max(2.0, radius * (f / 200.0))
-                # Параметр t в [0, 1]: 0 на внешнем краю перехода,
-                # 1 — на внутреннем. Центрируем переход на radius:
-                # внутренний край перехода = radius - fw/2,
-                # внешний край          = radius + fw/2.
-                t = np.clip((radius + fw / 2.0 - dist) / fw, 0.0, 1.0)
+                # Переход целиком внутри окружности: к краю холста
+                # альфа успевает затухнуть, без резкого среза.
+                t = np.clip((radius - dist) / fw, 0.0, 1.0)
                 # Smoothstep — кубическая S-кривая, гладкие производные
                 # на обоих концах. Выглядит мягче линейной градации.
                 mask = t * t * (3.0 - 2.0 * t)
@@ -7834,7 +8125,31 @@ class RoundCamWindow(QWidget):
         h = int(clamp(h, 1, max(1, fh - y)))
         return frame[y:y + h, x:x + w].copy()
 
-    def _compose_window_vignette_bgra(self, frame: np.ndarray, target_size: int, hard_edge: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    def _shared_vignette_confidence(self, frame, source, size, mirror):
+        if not (self.chroma.enabled and self.chroma.hybrid_enabled):
+            return None
+        if self.dynamic_crop.show_debug_view:
+            return None
+        cache_frame, cache_geometry, confidence = self._vignette_confidence
+        rect = self._dynamic_crop_runtime.crop_rect if self.dynamic_crop.enabled else self.crop.rect
+        geometry = source.shape, tuple(rect) if rect else None
+        if cache_frame is not frame or cache_geometry != geometry:
+            # Segment the centered composition once in camera orientation.
+            # Stretching or downscaling the output then only resamples confidence.
+            side = min(source.shape[:2])
+            square, _ = self._fit_square_with_optional_alpha(source, side)
+            confidence = self._hybrid_confidence(square)
+            self._vignette_confidence = frame, geometry, confidence
+        if confidence is None:
+            return None
+        if mirror:
+            confidence = cv2.flip(confidence, 1)
+        if confidence.shape == (size, size):
+            return confidence
+        return cv2.resize(confidence, (size, size), interpolation=cv2.INTER_LINEAR)
+
+    def _compose_window_vignette_bgra(self, frame: np.ndarray, target_size: int,
+                                      hard_edge: bool = False, mirror: bool | None = None) -> tuple[np.ndarray, np.ndarray]:
         """Собирает ровно тот же визуальный слой, что и плавающее окно.
 
         Возвращает BGR и alpha одинакового размера target_size × target_size.
@@ -7844,11 +8159,14 @@ class RoundCamWindow(QWidget):
         target = max(8, int(target_size))
         src = self._apply_crop_for_window(frame)
         src_alpha = self._dynamic_crop_alpha_for_window(frame) if bool(getattr(self.dynamic_crop, "enabled", False)) else None
+        if mirror is None:
+            mirror = self.state.vcam_mirror
         roi, roi_source_alpha = self._fit_square_with_optional_alpha(
-            src, target, alpha=src_alpha, mirror=bool(self.state.window_mirror))
+            src, target, alpha=src_alpha, mirror=mirror)
 
         if self.chroma.enabled:
-            alpha = self._build_alpha(roi)
+            confidence = self._shared_vignette_confidence(frame, src, target, mirror)
+            alpha = self._build_alpha(roi, confidence)
         else:
             alpha = np.full((target, target), 255, dtype=np.uint8)
 
@@ -7860,10 +8178,7 @@ class RoundCamWindow(QWidget):
             if should_shrink and visible_circle_size < min(roi.shape[:2]):
                 scale = visible_circle_size / max(1, min(roi.shape[:2]))
                 roi = self._shrink_into_canvas(roi, target, target, scale=scale)
-                if roi_source_alpha is not None:
-                    roi_source_alpha = self._shrink_into_canvas(roi_source_alpha, target, target,
-                                                                scale=scale, fill_value=0)
-                    alpha = (alpha.astype(np.uint16) * roi_source_alpha.astype(np.uint16) // 255).astype(np.uint8)
+                alpha = self._shrink_into_canvas(alpha, target, target, scale=scale, fill_value=0)
 
             cm = self._solid_circle_mask(visible_circle_size) if hard_edge else self._circle_mask(visible_circle_size)
             sm = np.zeros((target, target), dtype=np.uint8)
@@ -7897,32 +8212,57 @@ class RoundCamWindow(QWidget):
         sx1 = sx0 + (x1 - x0); sy1 = sy0 + (y1 - y0)
         dst[y0:y1, x0:x1] = src[sy0:sy1, sx0:sx1]
 
-    def _compose_telemost_layers(self, src_bgr: np.ndarray) -> np.ndarray | None:
-        """Слойная сборка режима «Телемост».
+    def _builtin_vcam_bg(self, width, height):
+        if self.state.vcam_builtin_bg == "white":
+            return np.full((height, width, 3), 255, dtype=np.uint8)
+        x = np.linspace(-1, 1, width, dtype=np.float32)
+        y = np.linspace(-1, 1, height, dtype=np.float32)
+        gray = (65 + 14 * x[None, :] - 15 * y[:, None]).astype(np.uint8)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-        Порядок слоёв:
-          1) нижняя подложка — белая или выбранный файл;
-          2) изображение виньетки — то же, что в плавающем окне;
-          3) фон аватарки с круглым вырезом.
-        """
-        W, H = self.vcam_w, self.vcam_h
-        if W <= 0 or H <= 0:
-            return None
-
-        bg = self._load_vcam_bg()
+    def _telemost_background(self, W, H, bg):
+        key = (W, H, self.state.vcam_circle_x, self.state.vcam_circle_y,
+               self.state.vcam_circle_r, self.state.vcam_avatar_bg_color,
+               self.state.vcam_builtin_bg)
+        cached = self._telemost_layers
+        if cached is not None and cached[0] == key and cached[1] is bg:
+            return cached[2]
         if bg is None:
-            # Базовая пропорция Телемоста из старого пресета. Белая подложка
-            # нужна не для красоты, а чтобы через прозрачные зоны кеинга не
-            # лезла чёрная техническая пустота.
-            bg = np.full((511, 855, 3), 255, dtype=np.uint8)
-
-        bottom, off_x, off_y, sx, sy = self._fit_bg_to_vcam(bg)
+            sx = sy = min(W / 855, H / 511)
+            off_x = (W - int(855 * sx)) // 2
+            off_y = (H - int(511 * sy)) // 2
+        else:
+            bottom, off_x, off_y, sx, sy = self._fit_bg_to_vcam(bg)
         cx = int(self.state.vcam_circle_x * sx) + off_x
         cy = int(self.state.vcam_circle_y * sy) + off_y
         cr = int(self.state.vcam_circle_r * min(sx, sy))
-        if cr < 4:
+        if cr > min(W, H) or cr < 4:
             cx, cy = W // 2, H // 2
             cr = max(4, min(W, H) // 4)
+
+        d = max(8, cr * 2)
+        tile_color = self._hex_to_bgr(self.state.vcam_avatar_bg_color)
+        base_frame = np.full((H, W, 3), tile_color, dtype=np.uint8)
+        if bg is None:
+            disk = self._builtin_vcam_bg(d, d)
+        else:
+            disk = np.full((d, d, 3), tile_color, dtype=np.uint8)
+            x0, y0 = cx - cr, cy - cr
+            left, top = max(0, x0), max(0, y0)
+            right, base = min(W, x0 + d), min(H, y0 + d)
+            if right > left and base > top:
+                disk[top-y0:base-y0, left-x0:right-x0] = bottom[top:base, left:right]
+        layers = cx, cy, cr, base_frame, disk, self._solid_circle_mask(d)
+        self._telemost_layers = key, bg, layers
+        return layers
+
+    def _compose_telemost_layers(self, src_bgr: np.ndarray) -> np.ndarray | None:
+        """Собирает портрет и фон плитки в координатах виртуальной камеры."""
+        W, H = self.vcam_w, self.vcam_h
+        if W <= 0 or H <= 0:
+            return None
+        bg = self._load_vcam_bg()
+        cx, cy, cr, base_frame, disk, disk_mask = self._telemost_background(W, H, bg)
 
         # cr*2 — это диаметр ВНУТРЕННЕГО видимого круга аватарки.
         # Если dynamic crop добавил crop_padding, слой виньетки должен быть
@@ -7931,25 +8271,17 @@ class RoundCamWindow(QWidget):
         inner_scale = self._dynamic_inner_circle_scale()
         if inner_scale is None:
             inner_scale = 1.0
-        vignette_canvas = max(d, int(round(d / max(0.05, float(inner_scale)))))
-        vignette_bgr, vignette_alpha = self._compose_window_vignette_bgra(
+        zoom = clamp(self.state.vcam_scale, 50, 200) / 100.0
+        # При увеличении держим портрет около линии глаз.
+        shift_y = round(d * 0.17 * (zoom - 1.0))
+        vignette_canvas = max(8, round(d * zoom / max(0.05, inner_scale)))
+        portrait, alpha = self._compose_window_vignette_bgra(
             src_bgr, vignette_canvas, hard_edge=True)
-
-        out = bottom.copy()
-        self._paste_with_alpha(out, vignette_bgr, vignette_alpha,
-                               cx - vignette_canvas // 2,
-                               cy - vignette_canvas // 2)
-
-        avatar_bgr = self._hex_to_bgr(getattr(self.state, "vcam_avatar_bg_color", "#202128"))
-        avatar_layer = np.full((H, W, 3), avatar_bgr, dtype=np.uint8)
-
-        hole = self._solid_circle_mask(d)
-        hole_full = np.zeros((H, W), dtype=np.uint8)
-        self._place_mask(hole_full, hole, cx - cr, cy - cr)
-        overlay_alpha = cv2.subtract(np.full((H, W), 255, dtype=np.uint8), hole_full)
-        a = (overlay_alpha.astype(np.float32) / 255.0)[..., None]
-        out = (avatar_layer.astype(np.float32) * a + out.astype(np.float32) * (1 - a)).astype(np.uint8)
-
+        out = base_frame.copy()
+        disk = disk.copy()
+        origin = cr - vignette_canvas // 2
+        self._paste_with_alpha(disk, portrait, alpha, origin, origin + shift_y)
+        self._paste_with_alpha(out, disk, disk_mask, cx - cr, cy - cr)
         return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
 
     def _compose_vcam_frame(self, src_bgr: np.ndarray) -> np.ndarray | None:
@@ -7969,7 +8301,7 @@ class RoundCamWindow(QWidget):
                               области просто чёрные.
              • background  — фон (если загружен) подставляется под
                               прозрачные области.
-             • circle      — режим «Телемост»: белая/выбранная подложка,
+             • circle      — режим «Телемост»: портретная/выбранная подложка,
                               виньетка как в основном окне, верхний фон
                               аватарки с круглым вырезом.
 
@@ -8078,8 +8410,11 @@ class RoundCamWindow(QWidget):
             rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
             return rgb
 
-        if mode == "background" and bg is not None:
-            bg_fitted, *_ = self._fit_bg_to_vcam(bg)
+        if mode == "background":
+            if bg is None:
+                bg_fitted = self._builtin_vcam_bg(self.vcam_w, self.vcam_h)
+            else:
+                bg_fitted, *_ = self._fit_bg_to_vcam(bg)
             return self._compose_with_background(canvas, alpha, bg_fitted)
 
         # passthrough — прозрачные пиксели становятся чёрными.
@@ -8518,7 +8853,6 @@ class RoundCamWindow(QWidget):
         self.set_chroma_enabled(self.chroma.enabled)
         self.set_crop_mode(self._current_crop_mode(), save=False)
         self._set_window_shape(self.state.window_shape)
-        self.act_vcam_fill.setChecked(self.state.vcam_fit == "fill")
         # Геометрия — на безопасное место
         self.reset_window_geometry()
         # Виртуальная камера возвращается к базовому профилю,
@@ -8706,6 +9040,8 @@ class RoundCamWindow(QWidget):
             s.vcam_bg_path = ""
         else:
             s.vcam_bg_path = bg_path
+        if s.vcam_builtin_bg not in ("gradient", "white"):
+            s.vcam_builtin_bg = "gradient"
         s.vcam_avatar_bg_color = _safe_hex_color(s.vcam_avatar_bg_color, defaults.vcam_avatar_bg_color)
         s.vcam_circle_x = _clamp_int(s.vcam_circle_x, defaults.vcam_circle_x, -10000, 10000)
         s.vcam_circle_y = _clamp_int(s.vcam_circle_y, defaults.vcam_circle_y, -10000, 10000)
@@ -8725,6 +9061,7 @@ class RoundCamWindow(QWidget):
         c.feather = _clamp_int(c.feather, 15, 0, 200)
         c.ui_opacity = _clamp_float(c.ui_opacity, 1.0, 0.25, 1.0)
         c.persist = _as_bool(c.persist, True)
+        c.hybrid_enabled = _as_bool(getattr(c, "hybrid_enabled", False), False)
         if not isinstance(c.picks, list):
             c.picks = ChromaConfig().picks
         normalized_picks = []
@@ -8746,6 +9083,11 @@ class RoundCamWindow(QWidget):
 
         d = self.dynamic_crop
         d.enabled = _as_bool(d.enabled, False)
+        d.auto_composition = _as_bool(getattr(d, "auto_composition", False), False)
+        d.composition_profile = str(getattr(d, "composition_profile", "shoulders"))
+        if d.composition_profile not in ("head", "shoulders", "torso"):
+            d.composition_profile = "shoulders"
+        d.composition_presets = _normalize_composition_presets(getattr(d, "composition_presets", None))
         d.max_composition_offset = _clamp_float(d.max_composition_offset, 0.5, 0.05, 1.0)
         d.offset_x = _clamp_float(d.offset_x, 0.0, -d.max_composition_offset, d.max_composition_offset)
         d.offset_y = _clamp_float(d.offset_y, -0.05, -d.max_composition_offset, d.max_composition_offset)
@@ -8923,13 +9265,14 @@ class RoundCamWindow(QWidget):
             # Мигрируем только типовые старые значения, пользовательские настройки не трогаем.
             try:
                 dc = self.dynamic_crop
-                if 1.95 <= float(getattr(dc, "circle_to_head", 2.0)) <= 2.05:
+                legacy_composition = "composition_presets" not in data.get("dynamic_crop", {})
+                if legacy_composition and 1.95 <= float(getattr(dc, "circle_to_head", 2.0)) <= 2.05:
                     dc.circle_to_head = 1.55
-                if 1.06 <= float(getattr(dc, "crop_padding", 1.08)) <= 1.10:
+                if legacy_composition and 1.06 <= float(getattr(dc, "crop_padding", 1.08)) <= 1.10:
                     dc.crop_padding = 1.02
                 if 0.10 <= float(getattr(dc, "center_dead_zone", 0.12)) <= 0.14:
                     dc.center_dead_zone = 0.06
-                if -0.07 <= float(getattr(dc, "offset_y", -0.05)) <= -0.03:
+                if legacy_composition and -0.07 <= float(getattr(dc, "offset_y", -0.05)) <= -0.03:
                     dc.offset_y = -0.14
             except Exception:
                 pass
@@ -9092,6 +9435,14 @@ class RoundCamWindow(QWidget):
 
         self._stop_vcam()
 
+        try:
+            segmenter = getattr(self, "_hybrid_segmenter", None)
+            if segmenter is not None:
+                segmenter.close()
+                self._hybrid_segmenter = None
+        except Exception as e:
+            _log_exc("Ошибка закрытия гибридного хромакея", e)
+
         self._stop_capture_loop(release=True, log=True)
 
         try:
@@ -9172,6 +9523,78 @@ def _cli_int_range(name: str, lo: int, hi: int):
         return value
     return parse
 
+def _verify_models(image_path: Path) -> int:
+    """Test packaged model loading and inference without opening a camera."""
+    from types import SimpleNamespace
+
+    from kgz_hybrid_chroma import HybridSegmenter
+
+    frame = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("Не удалось прочитать портрет для проверки моделей")
+
+    director = FaceAutoDirector()
+    segmenter = HybridSegmenter(_bundled_asset("selfie_segmenter.tflite"))
+    try:
+        cfg = FaceDirectorConfig(enabled=True, detector="mediapipe", analysis_scale_percent=100)
+        padded = cv2.copyMakeBorder(frame, 0, 0, 0, 48, cv2.BORDER_REPLICATE)
+        moved = cv2.copyMakeBorder(frame, 0, 0, 48, 0, cv2.BORDER_REPLICATE)
+        first = director.process(padded, cfg)
+        second = director.process(moved, cfg)
+        if not (first.face_found and second.face_found and director._mp_tasks_mode
+                and first.crop_rect and second.crop_rect and first.raw_face and second.raw_face
+                and second.raw_face.cx > first.raw_face.cx + 12):
+            raise RuntimeError("MediaPipe не отследил смещение портрета")
+        _logger.info("Проверка MediaPipe: автослежение OK")
+
+        confidence = segmenter.confidence(frame)
+        chroma = ChromaConfig(hybrid_enabled=True, use_hsv=False, picks=[])
+        alpha = RoundCamWindow._build_alpha(SimpleNamespace(chroma=chroma), frame, confidence)
+        if alpha.shape != frame.shape[:2] or alpha.min() > 32 or alpha.max() < 224:
+            raise RuntimeError("Гибридный хромакей не разделил человека и фон")
+        _logger.info("Проверка MediaPipe: гибридный хромакей OK")
+        return 0
+    finally:
+        segmenter.close()
+        director.close()
+
+
+def _check_live_camera(window):
+    """Exercise capture, processing and small reversible PTZ moves."""
+    frame = window.last_frame_bgr
+    result = window._face_director_last_result
+    if frame is None or window._last_vcam_rgb is None:
+        _logger.error("Live check: camera or virtual camera has no frames")
+        return
+    director = window._face_director
+    _logger.info("Live check: source=%s, backend=%s, face=%s, crop=%s, MediaPipe=%s, hybrid=%s",
+                 window.camera_index, window.cap.getBackendName(),
+                 bool(result and result.face_found), getattr(result, "crop_rect", None),
+                 bool(director and director._mp_tasks_mode),
+                 window.chroma.hybrid_enabled and window._hybrid_segmenter is not None)
+
+    axes = ("pan", "tilt", "zoom")
+    for axis in axes:
+        initial = window._ptz_read_axis(axis)
+        if initial is None:
+            _logger.error("Live check: %s read unavailable", axis)
+            continue
+        try:
+            moved = window._ptz_set_axis_absolute(axis, initial + (3 if axis != "zoom" else 4),
+                                                 reason="live check")
+            observed = window._ptz_read_axis(axis)
+        finally:
+            restored = window._ptz_set_axis_absolute(axis, initial, reason="live check restore")
+        _logger.info("Live check: %s initial=%s accepted=%s observed=%s restored=%s",
+                     axis, initial, moved, observed, restored and window._ptz_read_axis(axis) == initial)
+
+    camera, sent = window.vcam, window._last_vcam_rgb
+    QTimer.singleShot(1200, lambda: _logger.info(
+        "Live check: virtual camera continuous=%s, new frame=%s",
+        camera is not None and window.vcam is camera,
+        window._last_vcam_rgb is not None and window._last_vcam_rgb is not sent))
+
+
 def main():
     parser = argparse.ArgumentParser(description=f"{APP_NAME} – камера в круге/квадрате")
     parser.add_argument("--camera",      type=_cli_int_range("camera", 0, 32), default=None)
@@ -9186,7 +9609,17 @@ def main():
                         dest="vcam_res")
     parser.add_argument("--start-hidden",action="store_true")
     parser.add_argument("--debug",       action="store_true")
+    parser.add_argument("--check-live-camera", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--check-models", type=Path, metavar="PORTRAIT",
+                        help="проверить автослежение и сегментацию на портрете")
     args = parser.parse_args()
+    if args.check_models is not None:
+        setup_logger()
+        try:
+            sys.exit(_verify_models(args.check_models))
+        except Exception as e:
+            _log_exc("Проверка MediaPipe", e)
+            sys.exit(1)
     if (args.width == 0) != (args.height == 0):
         parser.error("--width и --height нужно задавать вместе либо не задавать вовсе")
     # Сохраним «было ли указано» в отдельный атрибут — нужен в RoundCamWindow
@@ -9222,6 +9655,9 @@ def main():
         w.set_vcam_enabled(True)
     elif args.start_hidden:
         w._release_frame_source_if_idle()
+
+    if args.check_live_camera:
+        QTimer.singleShot(4500, lambda: _check_live_camera(w))
 
     exit_code = app.exec_()
     w._cleanup_resources()

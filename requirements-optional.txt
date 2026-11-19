@@ -1,3 +1,2 @@
-# Optional dependency for FaceMesh-based tracking.
-# If it is unavailable, the application uses the OpenCV fallback.
-mediapipe
+# Required for MediaPipe tracking and hybrid chroma key.
+mediapipe==1.0.1
